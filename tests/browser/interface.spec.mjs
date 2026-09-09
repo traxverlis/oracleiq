@@ -134,8 +134,54 @@ test('administration has a visible heading and navigation', async ({ page }, tes
   await page.locator('.tabs-bar button').nth(1).click();
   await expect(page.locator('#tab-analyse')).toBeVisible();
   await expect(page.locator('#tab-oracle')).toBeHidden();
+  await expect(page.locator('#tab-analyse .setting-row')).toHaveCount(4);
+  await expect(page.locator('#thinking_budget, #roundsVal, [onclick*="analyzer_ai_mode"]')).toHaveCount(0);
+  await expect(page.locator('#ai_model')).toBeVisible();
+  await expect(page.locator('#ai_max_tokens')).toBeVisible();
+  await expect(page.locator('#plan_truncate')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('native-settings.png'), fullPage: true });
+  await page.locator('.tabs-bar button').nth(3).click();
+  await expect(page.locator('#promptModeSelect')).toHaveCount(0);
+  await expect(page.locator('#systemPromptEditor')).not.toHaveValue('');
+  await expect(page.locator('#promptModeLabel')).toContainText('natif');
   await page.locator('.tabs-bar button').first().click();
   await expect(page.locator('#tab-oracle')).toBeVisible();
+});
+
+test('deselecting all Oracle tools persists after reload', async ({ page }) => {
+  await login(page);
+  const original = await (await page.request.get('/api/settings')).json();
+  const saveSelection = async (action, expected) => {
+    const response = page.waitForResponse(response => response.url().endsWith('/api/settings') &&
+      response.request().method() === 'POST');
+    await action();
+    expect((await response).ok()).toBeTruthy();
+    const settings = await (await page.request.get('/api/settings')).json();
+    expect(settings.tools_enabled).toBe(expected);
+  };
+  try {
+    expect((await page.request.post('/api/settings', {
+      data: { tools_enabled: '', gather_stats_enabled: false },
+    })).ok()).toBeTruthy();
+    await page.goto('/settings');
+    await page.locator('.tabs-bar button').nth(2).click();
+    await expect(page.locator('#toolsGrid input:checked')).toHaveCount(12);
+    await saveSelection(() => page.getByRole('button', { name: 'Tout désélectionner' }).click(), 'none');
+    await page.reload();
+    await page.locator('.tabs-bar button').nth(2).click();
+    await expect(page.locator('#toolsGrid input:checked')).toHaveCount(0);
+    await expect(page.locator('#toolsGrid .tool-card.active')).toHaveCount(0);
+    await saveSelection(() => page.locator('#tool-describe_table').check(), 'describe_table');
+    await saveSelection(() => page.locator('#tool-describe_table').uncheck(), 'none');
+    await page.reload();
+    await page.locator('.tabs-bar button').nth(2).click();
+    await expect(page.locator('#toolsGrid input:checked')).toHaveCount(0);
+  } finally {
+    expect((await page.request.post('/api/settings', { data: {
+      tools_enabled: original.tools_enabled, gather_stats_enabled: original.gather_stats_enabled,
+    } })).ok()).toBeTruthy();
+  }
 });
 
 test('account models refresh preserves selection and cached catalog', async ({ page }, testInfo) => {
@@ -179,6 +225,61 @@ test('account models refresh preserves selection and cached catalog', async ({ p
   await expect(page.locator('#ai_model option[value="new-model"]')).toHaveCount(1);
   await page.locator('#ai_model').selectOption('new-model');
   await expect.poll(() => saves).toBe(1);
+});
+
+test('Copilot token testing saving deletion and env priority', async ({ page }, testInfo) => {
+  await login(page);
+  let source = null;
+  let saves = 0;
+  let refreshes = 0;
+  let catalog = { provider: 'github-copilot', models: [], updated_at: null };
+  await page.route('**/api/settings/github_token', route => {
+    const method = route.request().method();
+    if (method === 'POST') {
+      expect(route.request().postDataJSON().token).toBe('github_pat_browser_fixture');
+      source = 'file';
+      saves++;
+    }
+    if (method === 'DELETE') {
+      source = null;
+      catalog = { ...catalog, models: [], updated_at: null };
+    }
+    return route.fulfill({ json: { ok: true, configured: source !== null, source } });
+  });
+  await page.route('**/api/settings/github_token/test', route => route.fulfill({ json: { ok: true } }));
+  await page.route('**/api/models', route => route.fulfill({ json: catalog }));
+  await page.route('**/api/models/refresh', route => {
+    refreshes++;
+    catalog = { ...catalog, updated_at: 1700000000, models: [{ id: 'fixture', name: 'Fixture', vendor: '' }] };
+    return route.fulfill({ json: catalog });
+  });
+  await page.goto('/settings');
+  await page.locator('.tabs-bar button').nth(4).click();
+  await page.getByText('Comment créer ce jeton ?', { exact: true }).click();
+  await expect(page.locator('.help-steps')).toContainText('Copilot Requests');
+  const input = page.getByLabel('Jeton GitHub', { exact: true });
+  await expect(input).toHaveAttribute('type', 'password');
+  await input.fill('github_pat_browser_fixture');
+  await page.locator('[data-token-test]').click();
+  await expect(page.locator('[data-token-status]')).toContainText('Test sans enregistrement');
+  expect(saves).toBe(0);
+  await page.locator('[data-token-save]').click();
+  await expect(input).toHaveValue('');
+  await expect(page.locator('#accountModels')).toContainText('Fixture');
+  expect(saves).toBe(1);
+  await page.locator('[data-token-delete]').click();
+  await expect(page.locator('[data-token-status]')).toContainText('Aucun jeton configuré');
+  await expect(page.locator('#accountModels')).toContainText('Aucun catalogue enregistré');
+  expect(refreshes).toBe(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: testInfo.outputPath('copilot-token.png'), fullPage: true });
+  source = 'env';
+  await page.reload();
+  await page.locator('.tabs-bar button').nth(4).click();
+  await expect(input).toBeDisabled();
+  await expect(page.locator('[data-token-save]')).toBeDisabled();
+  await expect(page.locator('[data-token-delete]')).toBeDisabled();
+  await expect(page.locator('[data-token-test]')).toBeEnabled();
 });
 
 test('service health handles stale signals and request failures', async ({ page }) => {

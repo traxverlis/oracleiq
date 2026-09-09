@@ -226,7 +226,7 @@
   <section class="card" id="chatSection">
     <h2>💬 Discussion avec l'IA
       {% if is_admin %}<button class="btn-chat-clear" onclick="clearChat()" title="Effacer la conversation">🗑️</button>{% endif %}
-      {% if analyzer_ai_mode == 'native' %}<span style="font-size:11px;font-weight:400;color:#e8820c;margin-left:8px">🔧 Mode natif — peut interroger Oracle en direct</span>{% endif %}
+      <span style="font-size:11px;font-weight:400;color:#e8820c;margin-left:8px">🔧 Mode natif — peut interroger Oracle en direct</span>
     </h2>
     <div class="chat-history" id="chatHistory"></div>
     <div class="chat-input-row">
@@ -241,7 +241,6 @@
 
 <script>
 const QUERY_ID = Number(document.body.dataset.queryId);
-const ANALYZER_AI_MODE = "{{ analyzer_ai_mode }}";
 
 // ── Reset plan change ────────────────────────────────────────────────────
 // ── Bind Variables ─────────────────────────────────────────────
@@ -583,14 +582,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       const status = document.getElementById('analyzeStatus');
       if (status) status.style.display = 'block';
-      if (ANALYZER_AI_MODE === 'native') {
-        // Rebranche sur le stream SSE existant
-        reanalyzeNative(true);
-      } else {
-        // Mode classic : polling simple
-        if (status) status.textContent = '\u23f3 Analyse en cours...';
-        pollUntilDone();
-      }
+      reanalyzeNative(true);
     }
   }).catch(() => {});
 });
@@ -604,23 +596,7 @@ function reanalyze() {
   const status = document.getElementById('analyzeStatus');
   status.style.display = 'block';
 
-  if (ANALYZER_AI_MODE === 'native') {
-    reanalyzeNative();
-  } else {
-    status.textContent = '\u23f3 Rafra\u00eechissement du plan Oracle + analyse IA...';
-    fetch(`/api/analyze/${QUERY_ID}`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({})
-    }).then(r => r.json()).then(() => {
-      pollUntilDone();
-    }).catch(() => {
-      status.textContent = '\u274c Erreur';
-      btn.disabled = false;
-      btn.textContent = '\ud83d\udd04 Re-analyser';
-      btn.classList.remove('btn-analyzing');
-    });
-  }
+  reanalyzeNative();
 }
 
 function reanalyzeNative(resumeOnly) {

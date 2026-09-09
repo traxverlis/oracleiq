@@ -18,6 +18,8 @@ IGNORE_SYS_QUERIES  = os.getenv("IGNORE_SYS", "true").lower() == "true"
 # Providers : openai | anthropic | ollama | github-copilot
 AI_PROVIDER  = os.getenv("AI_PROVIDER", "github-copilot")
 AI_API_KEY   = os.getenv("AI_API_KEY", "")          # ta clé GitHub Copilot / OpenAI / Anthropic
+# Jeton GitHub (device flow) : si défini ici, prioritaire sur celui enregistré via l'administration
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 AI_MODEL     = os.getenv("AI_MODEL", "claude-sonnet-4.6")
 # GitHub Copilot endpoint : https://models.inference.ai.azure.com
 # OpenAI direct           : laisser vide
@@ -26,8 +28,6 @@ AI_BASE_URL  = os.getenv("AI_BASE_URL", "https://models.inference.ai.azure.com")
 
 # Tokens max pour les analyses IA (markdown complet)
 AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "8000"))
-# Budget de raisonnement IA : 0=off (~8s), 1024=rapide (~10s), 5000=standard (~30s)
-AI_THINKING_BUDGET = int(os.getenv("AI_THINKING_BUDGET", "1024"))
 
 # SQLite local
 DB_PATH = Path(os.getenv("ODIN_DB_PATH", str(BASE_DIR / "oracleiq.db")))

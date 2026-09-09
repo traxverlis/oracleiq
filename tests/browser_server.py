@@ -10,6 +10,10 @@ os.environ["ODIN_DB_PATH"] = str(Path(temporary.name) / "browser.db")
 os.environ["ODIN_ADMIN_PASSWORD"] = "test-admin-only"
 os.environ["ODIN_VIEWER_PASSWORD"] = "test-viewer-only"
 os.environ["ODIN_PUBLIC_READ"] = "true"
+os.environ["GITHUB_TOKEN"] = ""
+
+from analyzer import copilot_client
+copilot_client.TOKEN_CACHE_PATH = Path(temporary.name) / "copilot_token.json"
 
 from api.app import app
 from db.store import upsert_query, save_analysis, save_plan, chat_add_message, set_setting, get_conn

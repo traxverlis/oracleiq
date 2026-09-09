@@ -19,7 +19,7 @@ from analyzer.copilot_client import chat as copilot_chat
 # ─────────────────────────────────────────────
 # Prompt système
 # ─────────────────────────────────────────────
-from analyzer.oracle_tools import TOOLS_DESCRIPTION, parse_tool_calls, execute_tool
+from analyzer.oracle_tools import TOOLS_DESCRIPTION
 
 SYSTEM_PROMPT = """Tu es un expert Oracle Database 19c spécialisé en optimisation de performances SQL.
 Tu analyses des requêtes SQL et leurs plans d'exécution pour identifier les problèmes et proposer des corrections concrètes.
@@ -207,7 +207,11 @@ def parse_ai_response(raw: str) -> dict:
 
 
 def _build_initial_prompt(row: dict) -> str:
+    from db.store import get_setting
     plan_text = row.get("plan_text", "") or ""
+    plan_limit = int(get_setting("plan_truncate", "3000"))
+    if len(plan_text) > plan_limit:
+        plan_text = plan_text[:plan_limit] + "\n[plan tronqué...]"
     sql_id = row.get("sql_id", "")
     if not plan_text or "non disponible" in plan_text.lower() or "plan non disponible" in plan_text.lower():
         plan_section = f"""Non disponible.
@@ -229,12 +233,8 @@ pour générer un plan via EXPLAIN PLAN FOR. Cette opération est sécurisée (p
 
 
 def analyze_query(row: dict, oracle_conn=None) -> dict:
-    """Analyse une requête. Délègue au mode natif si configuré, sinon boucle classic."""
-    from db.store import get_setting
-    ANALYZER_AI_MODE = get_setting("analyzer_ai_mode", "classic")  # classic | agentic | native
-    if ANALYZER_AI_MODE == "native":
-        return analyze_query_native(row, oracle_conn=oracle_conn)
-    return _analyze_classic(row, oracle_conn=oracle_conn)
+    """Analyse une requête avec les outils natifs, quel que soit l'ancien réglage."""
+    return analyze_query_native(row, oracle_conn=oracle_conn)
 
 
 def _get_max_tokens() -> int:
@@ -246,175 +246,9 @@ def _get_max_tokens() -> int:
         return AI_MAX_TOKENS
 
 
-def _analyze_classic(row: dict, oracle_conn=None) -> dict:
-    """Analyse avec boucle agentique maison (classic ou agentic prompt)."""
-    from db.store import get_setting
-    messages = [{"role": "user", "content": _build_initial_prompt(row)}]
-    all_raw_parts = []
-    total_usage = {}
-    model_used = AI_MODEL
-
-    # Settings configurables
-    try:
-        MAX_TOOL_ROUNDS = max(1, min(int(get_setting("tool_rounds", "20")), 50))
-    except ValueError:
-        MAX_TOOL_ROUNDS = 20
-    ANALYZER_AI_MODE = get_setting("analyzer_ai_mode", "classic")  # classic | agentic
-
-    # Adapter le prompt système selon le mode
-    system_prompt = SYSTEM_PROMPT
-    if ANALYZER_AI_MODE == "agentic":
-        system_prompt = SYSTEM_PROMPT + f"""
-
-## Mode AGENTIC activé
-Tu peux utiliser jusqu'à {MAX_TOOL_ROUNDS} rounds d'outils. Utilise-les librement pour collecter TOUTES
-les informations dont tu as besoin avant de rédiger l'analyse finale.
-Quand tu as terminé tes investigations, rédige l'analyse complète avec SCORE: / SEVERITY: / SUMMARY:.
-"""
-
-    for round_idx in range(MAX_TOOL_ROUNDS + 1):
-        # Appel IA
-        if AI_PROVIDER in ("github-copilot", "copilot"):
-            raw, usage = copilot_chat(
-                messages=messages,
-                model=AI_MODEL,
-                max_tokens=_get_max_tokens(),
-                system=system_prompt,
-            )
-        elif AI_PROVIDER == "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(api_key=AI_API_KEY)
-            resp = client.messages.create(
-                model=AI_MODEL, max_tokens=_get_max_tokens(), system=system_prompt, messages=messages
-            )
-            raw, usage = resp.content[0].text, {}
-        else:
-            from openai import OpenAI
-            client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL or None)
-            resp = client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[{"role": "system", "content": system_prompt}] + messages,
-                temperature=0.1, max_tokens=_get_max_tokens(),
-            )
-            raw, usage = resp.choices[0].message.content, {}
-
-        all_raw_parts.append(raw)
-        for k, v in (usage or {}).items():
-            if isinstance(v, (int, float)):
-                total_usage[k] = total_usage.get(k, 0) + v
-
-        # En mode agentic : autoriser l'IA à appeler plusieurs tools par round (pas de limite sur le nombre)
-        # En mode classic : parser les tools normalement
-        tool_calls = parse_tool_calls(raw) if oracle_conn else []
-
-        # Mode agentic : si le modèle n'a pas encore rédigé SCORE/SEVERITY, on laisse tourner
-        if ANALYZER_AI_MODE == "agentic" and round_idx < MAX_TOOL_ROUNDS:
-            has_final = bool(parse_tool_calls.__module__) and "SCORE:" in raw
-            # Si pas de tools ET réponse finale détectée → on s'arrête
-            if not tool_calls and ("SCORE:" in raw or "score:" in raw.lower()):
-                break
-            # Si le modèle veut encore des tools → on continue
-            if tool_calls:
-                pass  # continuer la boucle
-            elif round_idx == 0:
-                # Première réponse sans tool ni SCORE → forcer une conclusion
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": "Rédige maintenant l'analyse finale en commençant par SCORE: / SEVERITY: / SUMMARY:"})
-                continue
-        else:
-            # Mode classic : stopper si pas de tools
-            if not tool_calls:
-                # Vérifier qu'on a bien une analyse finale (SCORE présent)
-                # Si pas de SCORE et pas de tools → le modèle divague, forcer une conclusion
-                has_final = bool(re.search(r'SCORE:\s*\d+', raw, re.IGNORECASE))
-                if has_final:
-                    break
-                # Pas de SCORE → forcer une conclusion
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale complète en commençant OBLIGATOIREMENT par SCORE: / SEVERITY: / SUMMARY:"})
-                if AI_PROVIDER in ("github-copilot", "copilot"):
-                    raw, usage = copilot_chat(messages=messages, model=AI_MODEL, max_tokens=_get_max_tokens(), system=system_prompt)
-                elif AI_PROVIDER == "anthropic":
-                    import anthropic
-                    client = anthropic.Anthropic(api_key=AI_API_KEY)
-                    resp = client.messages.create(model=AI_MODEL, max_tokens=_get_max_tokens(), system=system_prompt, messages=messages)
-                    raw, usage = resp.content[0].text, {}
-                else:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL or None)
-                    resp = client.chat.completions.create(model=AI_MODEL, messages=[{"role":"system","content":system_prompt}]+messages, temperature=0.1, max_tokens=_get_max_tokens())
-                    raw, usage = resp.choices[0].message.content, {}
-                all_raw_parts.append(raw)
-                for k, v in (usage or {}).items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
-                break
-            # Dernier round : exécuter les tools puis forcer une analyse finale
-            if round_idx == MAX_TOOL_ROUNDS:
-                messages.append({"role": "assistant", "content": raw})
-                tool_results = []
-                for name, args in tool_calls:
-                    result = execute_tool(oracle_conn, name, args)
-                    tool_results.append(f"### Résultat : {name}({', '.join(args)})\n```json\n{json.dumps(result, default=str, ensure_ascii=True, indent=2)}\n```")
-                feedback = "Voici les résultats des outils Oracle que tu as demandés :\n\n" + "\n\n".join(tool_results)
-                feedback += "\n\nTu as atteint le nombre maximum de rounds. Rédige MAINTENANT l'analyse finale complète en commençant obligatoirement par SCORE: / SEVERITY: / SUMMARY:"
-                messages.append({"role": "user", "content": feedback})
-                # Un dernier appel pour obtenir l'analyse finale
-                if AI_PROVIDER in ("github-copilot", "copilot"):
-                    raw, usage = copilot_chat(messages=messages, model=AI_MODEL, max_tokens=_get_max_tokens(), system=system_prompt)
-                elif AI_PROVIDER == "anthropic":
-                    import anthropic
-                    client = anthropic.Anthropic(api_key=AI_API_KEY)
-                    resp = client.messages.create(model=AI_MODEL, max_tokens=_get_max_tokens(), system=system_prompt, messages=messages)
-                    raw, usage = resp.content[0].text, {}
-                else:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL or None)
-                    resp = client.chat.completions.create(model=AI_MODEL, messages=[{"role":"system","content":system_prompt}]+messages, temperature=0.1, max_tokens=_get_max_tokens())
-                    raw, usage = resp.choices[0].message.content, {}
-                all_raw_parts.append(raw)
-                for k, v in (usage or {}).items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
-                break
-
-        # Ajouter la réponse de l'IA dans le fil de conversation
-        messages.append({"role": "assistant", "content": raw})
-
-        # Exécuter les outils et construire le message de résultats
-        tool_results = []
-        for name, args in tool_calls:
-            result = execute_tool(oracle_conn, name, args)
-            tool_results.append(f"### Résultat : {name}({', '.join(args)})\n```json\n{json.dumps(result, default=str, ensure_ascii=True, indent=2)}\n```")
-
-        feedback = "Voici les résultats des outils Oracle que tu as demandés :\n\n" + "\n\n".join(tool_results)
-        # Ne demander la conclusion que si on approche la fin, sinon laisser le modèle continuer
-        rounds_left = MAX_TOOL_ROUNDS - round_idx
-        if rounds_left <= 2:
-            feedback += "\n\nTu disposes encore de peu de rounds. Si tu as suffisamment d'informations, rédige l'analyse finale maintenant en commençant par SCORE: / SEVERITY: / SUMMARY:"
-        messages.append({"role": "user", "content": feedback})
-
-    # La dernière partie de raw contient l'analyse finale
-    final_raw = raw
-    full_raw = "\n\n---\n\n".join(all_raw_parts)
-    parsed = parse_ai_response(final_raw)
-    return {
-        "model": model_used,
-        "score": parsed.get("score", 50),
-        "severity": parsed.get("severity", "warning"),
-        "summary": parsed.get("summary", ""),
-        "issues": parsed.get("issues", []),
-        "recommendations": parsed.get("recommendations", []),
-        "raw": full_raw,
-        "usage": total_usage,
-    }
-
-
 def analyze_query_native(row: dict, oracle_conn=None) -> dict:
     """
-    Analyse avec vrai function calling natif (OpenAI tool_calls format).
-    Le modèle s'arrête quand il est satisfait — pas de limite arbitraire de rounds.
-    Compatible : GitHub Copilot (OpenAI-compatible endpoint).
+    Analyse avec outils natifs via le SDK Copilot, limitée à 30 appels Oracle.
     """
     from analyzer.copilot_client import chat_with_tools
     from analyzer.oracle_tools import execute_tool_native, get_tools_schema_filtered, SYSTEM_NATIVE_ANALYZE
@@ -422,12 +256,12 @@ def analyze_query_native(row: dict, oracle_conn=None) -> dict:
     import logging
 
     log = logging.getLogger("oracleiq")
-    model_used = AI_MODEL
     total_usage: dict = {}
     all_parts: list[str] = []
 
     # Prompt système : custom si configuré, sinon natif par défaut
     from db.store import get_setting
+    model_used = get_setting("ai_model", AI_MODEL)
     custom_prompt = get_setting("system_prompt", "")
     system_native = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else SYSTEM_NATIVE_ANALYZE
 

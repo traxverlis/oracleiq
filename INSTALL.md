@@ -65,7 +65,8 @@ python3 -m venv .venv
 source .venv/bin/activate          # Linux/macOS
 # .venv\Scripts\activate           # Windows
 
-pip install -r requirements.txt
+pip install -r requirements.lock
+python -m copilot download-runtime
 ```
 
 ---
@@ -85,9 +86,18 @@ ORACLE_USER=odin_user
 ORACLE_PASSWORD=VotreMotDePasse123!
 
 AI_PROVIDER=github-copilot          # ou openai | anthropic | ollama
-AI_API_KEY=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_TOKEN=github_pat_REMPLACER_PAR_VOTRE_JETON
 AI_MODEL=claude-sonnet-4.6
 ```
+
+Copilot utilise le SDK officiel et son runtime épinglé. Le jeton fine-grained doit
+appartenir au compte personnel et posséder la permission **Copilot Requests**.
+Les PAT classic (`ghp_`) ne sont pas supportés. `GITHUB_TOKEN` est prioritaire sur
+le jeton saisi dans Administration > Modèles ; après modification de `.env`,
+redémarrer ODIN. Le bouton Tester vérifie le catalogue sans enregistrer le jeton.
+Le SDK gère les limites du modèle : la longueur de réponse configurée dans ODIN
+est une consigne, et non un plafond strict. Aucun compte connecté au CLI n'est
+utilisé implicitement.
 
 ---
 

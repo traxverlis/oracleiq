@@ -163,6 +163,34 @@
       color: var(--text-dim);
       flex: 1;
     }
+
+    /* ─── Aide jeton GitHub ───────────────────────────────── */
+    .help-details {
+      margin: 8px 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: var(--bg);
+    }
+
+    .help-details summary {
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--blue);
+    }
+
+    .help-steps {
+      margin: 8px 0 2px;
+      padding-left: 20px;
+      font-size: 12px;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    .help-steps a {
+      color: var(--blue);
+    }
   </style>
 <link rel="stylesheet" href="/static/css/responsive.css">
 <script defer src="/static/vendor/lucide.js"></script>
@@ -359,40 +387,6 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Mode IA</label>
-            <span class="setting-desc">
-              <strong>Classic</strong> : linéaire, s'arrête dès que suffisant.<br>
-              <strong>Agentic</strong> : explore librement, plus profond et lent.<br>
-              <strong>Native 🔧</strong> : vrai function calling API. Recommandé pour les procédures complexes.
-            </span>
-          </div>
-          <div class="setting-control">
-            <button class="mode-btn {% if settings.analyzer_ai_mode == 'classic' %}active{% endif %}"
-              onclick="toggle('analyzer_ai_mode', 'classic')">Classic</button>
-            <button class="mode-btn {% if settings.analyzer_ai_mode == 'agentic' %}active{% endif %}"
-              onclick="toggle('analyzer_ai_mode', 'agentic')">Agentic ⚡</button>
-            <button class="mode-btn {% if settings.analyzer_ai_mode == 'native' %}active{% endif %}"
-              onclick="toggle('analyzer_ai_mode', 'native')">Native 🔧</button>
-          </div>
-        </div>
-
-        <div class="setting-row">
-          <div class="setting-info">
-            <label>Rounds d'outils Oracle</label>
-            <span class="setting-desc">Nombre max de rounds pendant lesquels l'IA peut appeler des outils (1-20)</span>
-          </div>
-          <div class="setting-control">
-            <div class="rounds-control">
-              <button class="rounds-btn" onclick="adjustRounds(-1)">-</button>
-              <span id="roundsVal" class="rounds-val">{{ settings.tool_rounds or '3' }}</span>
-              <button class="rounds-btn" onclick="adjustRounds(1)">+</button>
-              <span class="rounds-hint">rounds</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="setting-row">
-          <div class="setting-info">
             <label for="ai_model">Modèle IA</label>
             <span class="setting-desc">Modèle utilisé pour analyser les requêtes SQL</span>
             <span class="setting-desc" data-models-status role="status">Catalogue non actualisé</span>
@@ -435,27 +429,8 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Niveau de raisonnement</label>
-            <span class="setting-desc">Budget de tokens alloué à la réflexion interne du modèle</span>
-          </div>
-          <div class="setting-control">
-            <select id="thinking_budget" class="setting-select"
-              onchange="save('thinking_budget', parseInt(this.value))">
-              <option value="0" {% if settings.thinking_budget==0 %}selected{% endif %}>⚡ Off — ~8s</option>
-              <option value="1024" {% if settings.thinking_budget==1024 %}selected{% endif %}>💡 Rapide (1k) — ~10s ★
-              </option>
-              <option value="5000" {% if settings.thinking_budget==5000 %}selected{% endif %}>🧠 Standard (5k) — ~30s
-              </option>
-              <option value="10000" {% if settings.thinking_budget==10000 %}selected{% endif %}>🔬 Approfondi (10k) —
-                ~60s</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="setting-row">
-          <div class="setting-info">
-            <label>Tokens max (réponse)</label>
-            <span class="setting-desc">Longueur maximale de la réponse IA</span>
+            <label>Longueur de réponse (tokens)</label>
+            <span class="setting-desc">Longueur souhaitée, sans plafond strict avec le SDK Copilot.</span>
           </div>
           <div class="setting-control">
             <select id="ai_max_tokens" class="setting-select" onchange="save('ai_max_tokens', parseInt(this.value))">
@@ -480,7 +455,7 @@
               <option value="3000" {% if settings.plan_truncate==3000 %}selected{% endif %}>3000 chars ★</option>
               <option value="5000" {% if settings.plan_truncate==5000 %}selected{% endif %}>5000 chars — complet
               </option>
-              <option value="10000" {% if settings.plan_truncate==10000 %}selected{% endif %}>10000 chars — illimité
+              <option value="10000" {% if settings.plan_truncate==10000 %}selected{% endif %}>10000 chars — étendu
               </option>
             </select>
           </div>
@@ -627,12 +602,6 @@
         </p>
 
         <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap">
-          <select id="promptModeSelect" class="setting-select" style="max-width:200px" onchange="loadDefaultPrompt()">
-            <option value="classic" {% if settings.analyzer_ai_mode in ('classic','agentic') %}selected{% endif %}>
-              Prompt Classic / Agentic</option>
-            <option value="native" {% if settings.analyzer_ai_mode=='native' %}selected{% endif %}>Prompt Native 🔧
-            </option>
-          </select>
           <button class="mode-btn" id="btnShowDefault" onclick="loadDefaultPrompt()">👁 Voir le prompt par
             défaut</button>
           <span id="promptModeLabel" style="font-size:12px;color:var(--text-dim)"></span>
@@ -656,7 +625,7 @@
             <li>La liste des outils est générée automatiquement selon l'onglet Outils IA</li>
             <li><code>SCORE:</code> / <code>SEVERITY:</code> / <code>SUMMARY:</code> doivent toujours être dans la
               réponse finale</li>
-            <li>Le prompt s'applique à tous les modes. Réinitialiser = retour au prompt ODIN par défaut</li>
+            <li>Réinitialiser = retour au prompt natif ODIN par défaut</li>
           </ul>
         </div>
       </section>
@@ -666,6 +635,30 @@
        ONGLET 5 — Modèles
   ════════════════════════════════════════════════════ -->
     <div id="tab-models" class="tab-pane">
+      <section class="settings-section">
+        <h2>Jeton GitHub</h2>
+        <p class="setting-desc">Authentification du SDK officiel Copilot. Si la variable d'environnement
+          <code>GITHUB_TOKEN</code> est définie sur le serveur, elle est prioritaire et ce champ est désactivé.</p>
+        <details class="help-details">
+          <summary>Comment créer ce jeton ?</summary>
+          <ol class="help-steps">
+            <li>Le compte GitHub utilisé doit avoir un abonnement Copilot actif (individuel, ou siège assigné via une organisation/entreprise).</li>
+            <li>Créer un <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">jeton fine-grained</a> avec votre compte personnel comme <strong>Resource owner</strong>, pas une organisation.</li>
+            <li>Dans <strong>Permissions / Account</strong>, ajouter <strong>Copilot Requests</strong>. Choisir une expiration et ne pas accorder d'accès supplémentaire aux dépôts pour les analyses Oracle.</li>
+            <li>Utiliser le jeton <code>github_pat_…</code> ici ou dans <code>GITHUB_TOKEN</code>. Les jetons classic <code>ghp_…</code> ne sont pas pris en charge. <a href="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli" target="_blank" rel="noopener noreferrer">Documentation officielle</a>.</li>
+            <li>Cliquer sur <strong>Tester</strong> avant d'<strong>Enregistrer</strong> pour vérifier l'accès Copilot.</li>
+            <li>Le test contrôle l'accès au catalogue via le SDK, pas la génération d'une réponse IA. Ne jamais communiquer le jeton. Les politiques Copilot de l'organisation restent applicables.</li>
+          </ol>
+        </details>
+        <p class="comparison-status" data-token-status role="status">Chargement…</p>
+        <div class="setting-control" style="gap:8px;flex-wrap:wrap">
+          <input type="password" id="githubTokenInput" autocomplete="off" placeholder="github_pat_…" aria-label="Jeton GitHub" maxlength="4096"
+            style="flex:1;min-width:220px">
+          <button type="button" class="nav-btn" data-token-test>Tester</button>
+          <button type="button" class="nav-btn" data-token-save>Enregistrer</button>
+          <button type="button" class="nav-btn" data-token-delete>Supprimer</button>
+        </div>
+      </section>
       <section class="settings-section">
         <div class="health-heading">
           <h2>Modèles du compte Copilot</h2>
@@ -678,6 +671,7 @@
         </table>
       </section>
     </div>
+
 
   </div><!-- /container -->
 
@@ -713,27 +707,7 @@
       } else if (key === 'analyzer_mode') {
         document.getElementById('btnManual').classList.toggle('active', val === 'manual');
         document.getElementById('btnAuto').classList.toggle('active', val === 'auto');
-      } else if (key === 'analyzer_ai_mode') {
-        document.querySelectorAll('[onclick*="analyzer_ai_mode"]').forEach(btn => {
-          btn.classList.toggle('active', btn.getAttribute('onclick').includes(`'${val}'`));
-        });
-        // Synchroniser le sélecteur de prompt et recharger le prompt par défaut
-        const sel = document.getElementById('promptModeSelect');
-        if (sel) {
-          sel.value = (val === 'native') ? 'native' : 'classic';
-          // Recharger uniquement si onglet prompt visible et pas de prompt personnalisé 
-          const customPrompt = {{ settings.system_prompt | tojson }};
-          if (!customPrompt) loadDefaultPrompt();
-        }
       }
-    }
-
-    function adjustRounds(delta) {
-      const el = document.getElementById('roundsVal');
-      let val = parseInt(el.textContent) + delta;
-      val = Math.max(1, Math.min(20, val));
-      el.textContent = val;
-      save('tool_rounds', String(val));
     }
 
     // ─── Oracle ────────────────────────────────────────────────
@@ -842,6 +816,8 @@
       // CSV vide = tous actifs
       if (!_toolsCsv || _toolsCsv.trim() === '') {
         _toolsEnabled = new Set(ALL_TOOLS.filter(t => t !== 'gather_table_stats'));
+      } else if (_toolsCsv.trim() === 'none') {
+        _toolsEnabled = new Set();
       } else {
         _toolsEnabled = new Set(_toolsCsv.split(',').map(t => t.trim()).filter(Boolean));
       }
@@ -864,7 +840,7 @@
       // Reconstruire l'ensemble depuis les checkboxes (sauf gather_table_stats)
       const regular = ALL_TOOLS.filter(t => t !== 'gather_table_stats');
       const active = regular.filter(t => document.getElementById('tool-' + t)?.checked);
-      const csv = active.join(',');
+      const csv = active.length ? active.join(',') : 'none';
       _toolsEnabled = new Set(active);
       if (_gatherStats) _toolsEnabled.add('gather_table_stats');
       // Mettre à jour les styles
@@ -908,21 +884,20 @@
     let _defaultPrompts = null;
 
     function loadDefaultPrompt() {
-      const mode = document.getElementById('promptModeSelect')?.value || 'classic';
       const label = document.getElementById('promptModeLabel');
-      if (_defaultPrompts) { _applyDefaultPrompt(_defaultPrompts, mode); return; }
+      if (_defaultPrompts) { _applyDefaultPrompt(_defaultPrompts); return; }
       label.textContent = '⏳ Chargement...';
       fetch('/api/default_prompts').then(r => r.json()).then(d => {
         _defaultPrompts = d;
-        _applyDefaultPrompt(d, mode);
+        _applyDefaultPrompt(d);
       });
     }
 
-    function _applyDefaultPrompt(prompts, mode) {
+    function _applyDefaultPrompt(prompts) {
       const editor = document.getElementById('systemPromptEditor');
       const label = document.getElementById('promptModeLabel');
-      editor.value = prompts[mode] || prompts['classic'] || '';
-      label.textContent = '📄 Prompt par défaut chargé (' + mode + ') — modifiez puis Enregistrer';
+      editor.value = prompts.native || '';
+      label.textContent = '📄 Prompt natif par défaut chargé — modifiez puis Enregistrer';
       label.style.color = '#fbbf24';
       updatePromptHint();
     }

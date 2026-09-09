@@ -1189,6 +1189,8 @@ def get_active_tools() -> set[str]:
     # Vide = tous les tools publics activés
     if not csv or csv.strip() == "":
         active = set(TOOLS_PUBLIC)
+    elif csv.strip() == "none":
+        active = set()
     else:
         active = {t.strip() for t in csv.split(",") if t.strip() in TOOLS}
     # gather_table_stats contrôlé séparément

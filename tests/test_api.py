@@ -28,6 +28,59 @@ class ApiTests(unittest.TestCase):
                      "/api/queries/1/replay", "/api/analyze/1", "/api/queries/1/chat"):
             self.assertEqual(self.client.post(path, json={}).status_code, 403, path)
 
+    def test_github_token_management_saves_tests_and_deletes_without_leaking_secret(self):
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/api/settings/github_token").status_code, 401)
+        self.client.cookies.set(security.COOKIE_NAME, security.make_token())
+        with patch("api.app._copilot_client.github_token_source", return_value=None), \
+             patch("api.app._copilot_client.has_github_token", return_value=False):
+            response = self.client.get("/api/settings/github_token")
+            self.assertEqual(response.json(), {"configured": False, "source": None})
+
+        with patch("api.app._copilot_client.github_token_source", return_value="file") as save_source, \
+             patch("api.app._copilot_client.save_github_token") as save, \
+             patch("api.app.set_setting") as set_setting_mock:
+            response = self.client.post("/api/settings/github_token", json={"token": "super-secret-value"})
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("super-secret-value", response.text)
+            save.assert_called_once_with("super-secret-value")
+            set_setting_mock.assert_any_call("copilot_model_catalog", '{"models":[],"updated_at":null}')
+
+        with patch("api.app._copilot_client.github_token_source", return_value="env"):
+            response = self.client.post("/api/settings/github_token", json={"token": "x"})
+            self.assertEqual(response.status_code, 409)
+            response = self.client.delete("/api/settings/github_token")
+            self.assertEqual(response.status_code, 409)
+
+        with patch("api.app._copilot_client.github_token_source", return_value="file"), \
+             patch("api.app._copilot_client.delete_github_token") as delete, \
+             patch("api.app.set_setting") as set_setting_mock:
+            response = self.client.delete("/api/settings/github_token")
+            self.assertEqual(response.status_code, 200)
+            delete.assert_called_once()
+            set_setting_mock.assert_any_call("copilot_model_catalog", '{"models":[],"updated_at":null}')
+
+        with patch("api.app._copilot_client.test_github_token") as test:
+            response = self.client.post("/api/settings/github_token/test", json={"token": "candidate"})
+            self.assertEqual(response.json(), {"ok": True})
+            test.assert_called_once_with("candidate")
+        from analyzer.copilot_client import CopilotAuthenticationError
+        with patch("api.app._copilot_client.test_github_token", side_effect=CopilotAuthenticationError("Echange du jeton Copilot refuse (HTTP 404). Acces direct au catalogue Copilot refuse (HTTP 403).")):
+            response = self.client.post("/api/settings/github_token/test", json={})
+            self.assertFalse(response.json()["ok"])
+            self.assertIn("HTTP 404", response.json()["error"])
+            self.assertIn("HTTP 403", response.json()["error"])
+        with patch("api.app._copilot_client.test_github_token", side_effect=RuntimeError("private-secret")):
+            response = self.client.post("/api/settings/github_token/test", json={})
+            self.assertFalse(response.json()["ok"])
+            self.assertNotIn("private-secret", response.text)
+        with patch("api.app._copilot_client.test_github_token", side_effect=ConnectionError("connect timeout to 10.0.0.1 with secret-token-abc")):
+            response = self.client.post("/api/settings/github_token/test", json={})
+            self.assertEqual(response.json()["ok"], False)
+            self.assertNotIn("secret-token-abc", response.text)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.post("/api/settings/github_token/test", json={}).status_code, 403)
+
     def test_health_is_admin_only_even_with_public_read(self):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
@@ -67,7 +120,18 @@ class ApiTests(unittest.TestCase):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200, path)
 
+    def test_only_native_settings_and_prompt_are_exposed(self):
+        with patch("api.app.get_setting", side_effect=lambda key, default=None: "classic" if key == "analyzer_ai_mode" else default):
+            settings = self.client.get("/api/settings").json()
+            self.assertEqual(settings["analyzer_ai_mode"], "native")
+            self.assertNotIn("tool_rounds", settings)
+            self.assertNotIn("thinking_budget", settings)
+        self.assertEqual(set(self.client.get("/api/default_prompts").json()), {"native"})
+
     def test_settings_validation_and_password_redaction(self):
+        for mode in ("classic", "agentic"):
+            self.assertEqual(self.client.post("/api/settings", json={"analyzer_ai_mode": mode}).status_code, 422)
+        self.assertEqual(self.client.post("/api/settings", json={"thinking_budget": 1024}).status_code, 422)
         self.assertEqual(self.client.post("/api/settings", json={"tool_rounds": -1}).status_code, 422)
         self.assertEqual(self.client.post("/api/settings", json={"analyzer_mode": "invalid"}).status_code, 422)
         with patch("api.app.set_setting") as save:
@@ -91,6 +155,30 @@ class ApiTests(unittest.TestCase):
         finally:
             store.analyzing_queue_remove(query_id)
             analyzing_ids.discard(query_id)
+            store.delete_query_data(query_id)
+
+    def test_native_stream_honors_settings_through_final_response(self):
+        query_id = store.upsert_query({"sql_id": "native-stream", "sql_text": "select 1 from dual", "sql_hash": "native-stream"})
+        settings = {"ai_model": "saved-model", "ai_max_tokens": "8000", "system_prompt": "Custom native"}
+        lookup = lambda key, default=None: settings.get(key, default)
+        responses = [("Preliminary", [], {}), ("Still preliminary", [], {}),
+                     ("SCORE: 75\nSEVERITY: warning\nSUMMARY: Test", [], {})]
+        try:
+            with patch("api.app.get_setting", side_effect=lookup), \
+                    patch("db.store.get_setting", side_effect=lookup), \
+                    patch("api.app.connect_oracle", side_effect=RuntimeError("Offline fixture")), \
+                    patch("analyzer.oracle_tools.get_tools_schema_filtered", return_value=[]), \
+                    patch("analyzer.copilot_client.chat_with_tools", side_effect=responses) as chat:
+                response = self.client.get(f"/api/analyze/{query_id}/stream")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('"type": "done"', response.text)
+            self.assertEqual(chat.call_count, 3)
+            for invocation in chat.call_args_list:
+                self.assertEqual(invocation.kwargs["model"], "saved-model")
+                self.assertEqual(invocation.kwargs["max_tokens"], 8000)
+                self.assertEqual(invocation.kwargs["system"], "Custom native")
+                self.assertEqual(invocation.kwargs["tools"], [])
+        finally:
             store.delete_query_data(query_id)
 
     def test_comparison_reads_validate_query_and_parameters(self):

@@ -10,6 +10,7 @@
   const current = select.dataset.currentModel;
   if (![...select.options].some(option => option.value === current)) select.add(new Option(current, current));
   select.value = current;
+  const localOptions = [...select.children].map(option => option.cloneNode(true));
 
   function status(text, error = false) {
     for (const target of statuses) {
@@ -25,6 +26,14 @@
       return;
     }
     if (catalog.updated_at == null) {
+      const selected = select.value;
+      select.replaceChildren(...localOptions.map(option => option.cloneNode(true)));
+      if (![...select.options].some(option => option.value === selected)) select.add(new Option(selected, selected));
+      select.value = selected;
+      table.replaceChildren();
+      const cell = table.insertRow().insertCell();
+      cell.colSpan = 3;
+      cell.textContent = 'Aucun catalogue enregistré.';
       status('Catalogue du compte non actualisé. Liste locale dans le sélecteur.');
       return;
     }
@@ -74,4 +83,98 @@
 
   for (const button of buttons) button.addEventListener('click', () => load(true));
   load();
+
+  // ─── Jeton GitHub ──────────────────────────────────────────
+  const tokenInput = document.getElementById('githubTokenInput');
+  const tokenStatus = document.querySelector('[data-token-status]');
+  const tokenTestBtn = document.querySelector('[data-token-test]');
+  const tokenSaveBtn = document.querySelector('[data-token-save]');
+  const tokenDeleteBtn = document.querySelector('[data-token-delete]');
+  let tokenBusy = false;
+
+  function tokenSetStatus(text, error = false) {
+    tokenStatus.textContent = text;
+    tokenStatus.classList.toggle('error-text', error);
+  }
+
+  function tokenSetBusy(state) {
+    tokenBusy = state;
+    const envManaged = tokenInput.dataset.envManaged === 'true';
+    tokenInput.disabled = state || envManaged;
+    tokenTestBtn.disabled = state;
+    tokenSaveBtn.disabled = state || envManaged;
+    tokenDeleteBtn.disabled = state || envManaged;
+  }
+
+  async function tokenRefreshStatus() {
+    try {
+      const info = await requestJSON('/api/settings/github_token');
+      tokenInput.dataset.envManaged = info.source === 'env' ? 'true' : 'false';
+      if (info.source === 'env') {
+        tokenSetStatus('Jeton défini via la variable GITHUB_TOKEN sur le serveur (prioritaire, non modifiable ici).');
+      } else if (info.configured) {
+        tokenSetStatus('Jeton enregistré via l\u2019administration.');
+      } else {
+        tokenSetStatus('Aucun jeton configuré.');
+      }
+      tokenSetBusy(false);
+    } catch (error) {
+      tokenSetStatus(error.message, true);
+    }
+  }
+
+  tokenTestBtn.addEventListener('click', async () => {
+    if (tokenBusy) return;
+    tokenSetBusy(true);
+    tokenSetStatus('Test du jeton en cours…');
+    try {
+      const body = tokenInput.value.trim() ? { token: tokenInput.value.trim() } : {};
+      const result = await requestJSON('/api/settings/github_token/test', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      tokenSetStatus(result.ok ? 'Accès au catalogue confirmé par le SDK Copilot. Test sans enregistrement.' : (result.error || 'Connexion refusée.'), !result.ok);
+    } catch (error) {
+      tokenSetStatus(error.message, true);
+    } finally {
+      tokenSetBusy(false);
+    }
+  });
+
+  tokenSaveBtn.addEventListener('click', async () => {
+    if (tokenBusy) return;
+    const token = tokenInput.value.trim();
+    if (!token) { tokenSetStatus('Saisis un jeton avant d\u2019enregistrer.', true); return; }
+    tokenSetBusy(true);
+    tokenSetStatus('Enregistrement…');
+    try {
+      await requestJSON('/api/settings/github_token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }),
+      });
+      tokenInput.value = '';
+      tokenSetStatus('Jeton enregistré. Catalogue de modèles réinitialisé.');
+      await tokenRefreshStatus();
+      load(true);
+    } catch (error) {
+      tokenSetStatus(error.message, true);
+      tokenSetBusy(false);
+    }
+  });
+
+  tokenDeleteBtn.addEventListener('click', async () => {
+    if (tokenBusy) return;
+    tokenSetBusy(true);
+    tokenSetStatus('Suppression…');
+    try {
+      await requestJSON('/api/settings/github_token', { method: 'DELETE' });
+      tokenInput.value = '';
+      tokenSetStatus('Jeton supprimé.');
+      await tokenRefreshStatus();
+      load();
+    } catch (error) {
+      tokenSetStatus(error.message, true);
+      tokenSetBusy(false);
+    }
+  });
+
+  tokenRefreshStatus();
 })();

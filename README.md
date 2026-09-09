@@ -1,4 +1,4 @@
-# ODIN — Observation · Détection · Intelligence · Notification
+# ODIN — Oracle · Détection · Intelligence · Notification
 
 > Outil de surveillance et d'analyse de performances SQL boosté IA
 
@@ -46,7 +46,7 @@ oracleiq/
 │
 ├── analyzer/
 │   ├── ai_analyzer.py        ← Boucle d'analyse IA agentique (multi-providers)
-│   ├── copilot_client.py     ← Client GitHub Copilot (Azure Inference)
+│   ├── copilot_client.py     ← Connecteur SDK officiel GitHub Copilot
 │   └── oracle_tools.py       ← Outils Oracle read-only disponibles à l'IA
 │
 ├── api/
@@ -83,7 +83,8 @@ oracleiq/
 
 - `oracledb >= 2.0.0` — driver Oracle pur Python (pas besoin d'Instant Client pour thin mode)
 - `fastapi >= 0.111.0` + `uvicorn` — interface web
-- `openai >= 1.30.0` — client OpenAI/GitHub Copilot
+- `openai >= 1.30.0` — client OpenAI/Ollama
+- `github-copilot-sdk == 1.0.13` — SDK officiel et runtime Copilot épinglé
 - `anthropic >= 0.28.0` — client Anthropic Claude
 - `rich >= 13.7.0` — affichage console
 - `jinja2` — templates HTML
@@ -98,7 +99,7 @@ Au moins l'un des providers suivants :
 
 | Provider | Où obtenir la clé |
 |----------|------------------|
-| GitHub Copilot | [github.com/settings/tokens](https://github.com/settings/tokens) (token avec accès Copilot) |
+| GitHub Copilot | [Jeton fine-grained personnel](https://github.com/settings/personal-access-tokens/new), permission **Copilot Requests** |
 | OpenAI | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | Anthropic | [console.anthropic.com](https://console.anthropic.com/) |
 | Ollama | Pas de clé — installation locale : [ollama.ai](https://ollama.ai) |
@@ -140,6 +141,7 @@ source .venv/bin/activate
 
 ```bash
 pip install -r requirements.lock
+python -m copilot download-runtime
 ```
 
 ### 4. Configurer
@@ -163,7 +165,7 @@ ORACLE_DSN=monserveur:1521/ORCL
 ORACLE_USER=odin_user
 ORACLE_PASSWORD=mon_mot_de_passe_secret
 AI_PROVIDER=github-copilot
-AI_API_KEY=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_TOKEN=github_pat_REMPLACER_PAR_VOTRE_JETON
 AI_MODEL=claude-sonnet-4.6
 ODIN_ADMIN_PASSWORD=choisir_un_mot_de_passe_long_et_unique
 ODIN_SESSION_SECRET=generer_un_secret_aleatoire_long
@@ -262,18 +264,21 @@ Si vous ne pouvez pas obtenir les GRANTs DBA, ODIN fonctionne en mode dégradé 
 
 | Provider | `AI_PROVIDER` | Modèles recommandés | `AI_BASE_URL` |
 |----------|--------------|---------------------|--------------|
-| GitHub Copilot | `github-copilot` | `claude-sonnet-4.6`, `gpt-4o` | `https://models.inference.ai.azure.com` |
+| GitHub Copilot | `github-copilot` | Catalogue du compte dans Administration > Modèles | Gérée par le SDK |
 | OpenAI | `openai` | `gpt-4o`, `gpt-4o-mini` | *(laisser vide)* |
 | Anthropic | `anthropic` | `claude-3-5-sonnet-20241022`, `claude-opus-4-5` | *(non utilisé)* |
 | Ollama (local) | `ollama` | `llama3`, `mistral`, `qwen2.5-coder` | `http://localhost:11434/v1` |
 
 ### GitHub Copilot (recommandé)
 
-Le provider par défaut. Nécessite un token GitHub avec accès Copilot. Donne accès à Claude Sonnet et GPT-4o sans frais supplémentaires si vous avez un abonnement GitHub Copilot.
+Le provider par défaut utilise le SDK officiel. Créer un PAT fine-grained avec le
+compte personnel comme Resource owner et la permission de compte **Copilot Requests**.
+Les PAT classic (`ghp_`) ne sont pas supportés. Les modèles accessibles, quotas et
+frais dépendent du forfait et des politiques Copilot du compte.
 
 ```ini
 AI_PROVIDER=github-copilot
-AI_API_KEY=ghp_votre_token_github
+GITHUB_TOKEN=github_pat_REMPLACER_PAR_VOTRE_JETON
 AI_MODEL=claude-sonnet-4.6
 AI_BASE_URL=https://models.inference.ai.azure.com
 ```
@@ -322,11 +327,11 @@ Toutes les variables peuvent être définies dans le fichier `.env` à la racine
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `AI_PROVIDER` | `github-copilot` | Provider : `openai`, `anthropic`, `ollama`, `github-copilot` |
-| `AI_API_KEY` | *(vide)* | Clé API du provider choisi |
+| `AI_API_KEY` | *(vide)* | Clé API OpenAI/Anthropic/Ollama, ignorée par Copilot |
+| `GITHUB_TOKEN` | *(vide)* | Jeton Copilot prioritaire sur celui enregistré dans Administration > Modèles |
 | `AI_MODEL` | `claude-sonnet-4.6` | Modèle à utiliser (dépend du provider) |
 | `AI_BASE_URL` | `https://models.inference.ai.azure.com` | URL de base de l'API (vide pour OpenAI direct) |
 | `AI_MAX_TOKENS` | `8000` | Nombre maximum de tokens pour une analyse |
-| `AI_THINKING_BUDGET` | `1024` | Budget de raisonnement (0=off, 1024=rapide, 5000=standard) |
 
 ### Interface Web
 

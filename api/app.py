@@ -55,10 +55,8 @@ install_security(app)
 class SettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     analyzer_mode: Literal["auto", "manual"] | None = None
-    analyzer_ai_mode: Literal["classic", "agentic", "native"] | None = None
-    tool_rounds: int | None = Field(default=None, ge=1, le=30)
+    analyzer_ai_mode: Literal["native"] | None = None
     collector_active: bool | None = None
-    thinking_budget: Literal[0, 1024, 5000, 10000] | None = None
     ai_model: str | None = Field(default=None, min_length=1, max_length=200)
     ai_max_tokens: int | None = Field(default=None, ge=256, le=64000)
     plan_truncate: int | None = Field(default=None, ge=100, le=100000)
@@ -146,7 +144,6 @@ def api_stats():
     stats = get_query_stats()
     stats["analyzer_mode"] = get_setting("analyzer_mode", "manual")
     stats["collector_active"] = get_setting("collector_active", "true") == "true"
-    stats["thinking_budget"] = int(get_setting("thinking_budget", "1024"))
     # Merger les analyses en cours : bouton manuel (mémoire) + analyzer auto (DB)
     from db.store import analyzing_queue_get
     all_analyzing = set(analyzing_ids) | set(analyzing_queue_get())
@@ -189,11 +186,9 @@ async def purge_queries(request: Request):
 
 @app.get("/api/default_prompts")
 def get_default_prompts():
-    """Retourne les prompts système par défaut (classic et native)."""
-    from analyzer.ai_analyzer import SYSTEM_PROMPT
+    """Retourne le prompt système natif par défaut."""
     from analyzer.oracle_tools import SYSTEM_NATIVE_ANALYZE
     return {
-        "classic": SYSTEM_PROMPT,
         "native":  SYSTEM_NATIVE_ANALYZE,
     }
 
@@ -223,6 +218,58 @@ def refresh_model_catalog(request: Request):
     return {**catalog, "provider": AI_PROVIDER}
 
 
+@app.get("/api/settings/github_token")
+def github_token_status(request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    return {"configured": _copilot_client.has_github_token(), "source": _copilot_client.github_token_source()}
+
+
+@app.post("/api/settings/github_token")
+async def save_github_token_endpoint(request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    if _copilot_client.github_token_source() == "env":
+        raise HTTPException(409, "Jeton géré via la variable d'environnement GITHUB_TOKEN, non modifiable ici.")
+    body = await request.json()
+    token = (body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(422, "Jeton requis")
+    await run_in_threadpool(_copilot_client.save_github_token, token)
+    set_setting("copilot_model_catalog", '{"models":[],"updated_at":null}')
+    return {"ok": True}
+
+
+@app.delete("/api/settings/github_token")
+def delete_github_token_endpoint(request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    if _copilot_client.github_token_source() == "env":
+        raise HTTPException(409, "Jeton géré via la variable d'environnement GITHUB_TOKEN, non modifiable ici.")
+    _copilot_client.delete_github_token()
+    set_setting("copilot_model_catalog", '{"models":[],"updated_at":null}')
+    return {"ok": True}
+
+
+@app.post("/api/settings/github_token/test")
+async def test_github_token_endpoint(request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    token = (body.get("token") or "").strip() or None
+    try:
+        await run_in_threadpool(_copilot_client.test_github_token, token)
+    except _copilot_client.CopilotAuthenticationError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": f"Connexion au service Copilot impossible ({type(e).__name__})."}
+    return {"ok": True}
+
+
 @app.get("/api/settings")
 def get_all_settings(request: Request):
     """Retourne tous les paramètres configurables."""
@@ -230,10 +277,8 @@ def get_all_settings(request: Request):
         raise HTTPException(403, "Droits administrateur requis")
     return {
         "analyzer_mode":    get_setting("analyzer_mode", "manual"),
-        "analyzer_ai_mode": get_setting("analyzer_ai_mode", "classic"),
-        "tool_rounds":      int(get_setting("tool_rounds", "3")),
+        "analyzer_ai_mode": "native",
         "collector_active": get_setting("collector_active", "true") == "true",
-        "thinking_budget":  int(get_setting("thinking_budget", "1024")),
         "ai_model":         get_setting("ai_model", "claude-sonnet-4.6"),
         "ai_max_tokens":    int(get_setting("ai_max_tokens", "8000")),
         "plan_truncate":    int(get_setting("plan_truncate", "3000")),
@@ -281,16 +326,6 @@ async def set_collector_active(request: Request):
         raise HTTPException(422, "active doit etre un booleen")
     set_setting("collector_active", "true" if active else "false")
     return {"ok": True, "active": active}
-
-
-@app.post("/api/settings/thinking_budget")
-async def set_thinking_budget(request: Request):
-    body = await request.json()
-    budget = body.get("budget", 1024)
-    if budget not in (0, 1024, 5000, 10000):
-        raise HTTPException(400, "budget doit être 0, 1024, 5000 ou 10000")
-    set_setting("thinking_budget", str(budget))
-    return {"ok": True, "budget": budget}
 
 
 @app.post("/api/settings/test_oracle")
@@ -470,7 +505,7 @@ async def analyze_query_endpoint(query_id: int, request: Request):
 
             # Analyse agentique (avec connexion Oracle si disponible)
             ai_model = get_setting("ai_model", "claude-sonnet-4.6")
-            log.info(f"Analyze {query_id}: starting agentic analysis, oracle={'yes' if conn_ora else 'no'}")
+            log.info(f"Analyze {query_id}: starting native analysis, oracle={'yes' if conn_ora else 'no'}")
             result = _analyze_query(q, oracle_conn=conn_ora)
             log.info(f"Analyze {query_id}: done score={result['score']} severity={result['severity']} usage={result['usage']}")
             save_analysis(query_id, {**result, "model": ai_model})
@@ -557,7 +592,6 @@ async def analyze_query_stream(query_id: int, request: Request):
         try:
             from db.store import get_conn as gc, save_analysis, save_plan
             from analyzer.ai_analyzer import _build_initial_prompt, parse_ai_response
-            from analyzer.oracle_tools import TOOLS_SCHEMA, execute_tool_native
             from analyzer.copilot_client import chat_with_tools
             import logging
             log = logging.getLogger("oracleiq")
@@ -609,8 +643,11 @@ async def analyze_query_stream(query_id: int, request: Request):
 
             # Boucle native avec SSE
             model_used = get_setting("ai_model", "claude-sonnet-4.6")
-            from analyzer.oracle_tools import TOOLS_SCHEMA, execute_tool_native, SYSTEM_NATIVE_ANALYZE
-            system_native = SYSTEM_NATIVE_ANALYZE
+            from analyzer.oracle_tools import get_tools_schema_filtered, execute_tool_native, SYSTEM_NATIVE_ANALYZE
+            from analyzer.ai_analyzer import _get_max_tokens
+            tools_schema = get_tools_schema_filtered()
+            system_native = get_setting("system_prompt", "").strip() or SYSTEM_NATIVE_ANALYZE
+            max_tokens = _get_max_tokens()
 
             messages = [{"role": "user", "content": _build_initial_prompt(q)}]
             total_usage: dict = {}
@@ -622,8 +659,8 @@ async def analyze_query_stream(query_id: int, request: Request):
             while True:
                 _broadcast({"type": "status", "message": "🤔 IA réfléchit..."})
                 text, tool_calls, usage = chat_with_tools(
-                    messages=messages, tools=TOOLS_SCHEMA,
-                    model=model_used, max_tokens=4000, system=system_native,
+                    messages=messages, tools=tools_schema,
+                    model=model_used, max_tokens=max_tokens, system=system_native,
                 )
                 for k, v in (usage or {}).items():
                     if isinstance(v, (int, float)):
@@ -643,8 +680,8 @@ async def analyze_query_stream(query_id: int, request: Request):
                         messages.append({"role": "user", "content": "Tu dois appeler au moins un outil Oracle pour collecter les informations nécessaires avant de rédiger l'analyse."})
                         _broadcast({"type": "status", "message": "🤔 IA réfléchit..."})
                         text, tool_calls, usage = chat_with_tools(
-                            messages=messages, tools=TOOLS_SCHEMA,
-                            model=model_used, max_tokens=4000, system=system_native,
+                            messages=messages, tools=tools_schema,
+                            model=model_used, max_tokens=max_tokens, system=system_native,
                             tool_choice="required",
                         )
                         for k, v in (usage or {}).items():
@@ -657,7 +694,7 @@ async def analyze_query_stream(query_id: int, request: Request):
                             _broadcast({"type": "status", "message": "⚠️ Pas d'outils disponibles, conclusion forcée"})
                             messages.append({"role": "assistant", "content": text or ""})
                             messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale avec SCORE: / SEVERITY: / SUMMARY: basée sur le SQL et le plan d'exécution fournis."})
-                            text3, _, usage3 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=4000, system=system_native)
+                            text3, _, usage3 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=max_tokens, system=system_native)
                             if text3:
                                 all_parts.append(text3)
                                 _broadcast({"type": "analysis", "content": text3})
@@ -682,7 +719,7 @@ async def analyze_query_stream(query_id: int, request: Request):
                         for tc in tool_calls:
                             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps({"error": "Limite atteinte."})})
                     messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale avec SCORE: / SEVERITY: / SUMMARY:"})
-                    text2, _, usage2 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=4000, system=system_native)
+                    text2, _, usage2 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=max_tokens, system=system_native)
                     if text2:
                         all_parts.append(text2)
                         _broadcast({"type": "analysis", "content": text2})
@@ -1090,67 +1127,44 @@ def _post_chat(query_id: int, body: dict):
     chat_add_message(query_id, "user", user_msg)
 
     # Appel IA
-    ai_mode = get_setting("analyzer_ai_mode", "classic")
     ai_model = get_setting("ai_model", "claude-sonnet-4.6")
     conn_ora = None
     try:
-        if ai_mode == "native":
-            # Mode natif : outils Oracle disponibles en live
-            from analyzer.oracle_tools import TOOLS_SCHEMA, execute_tool_native
-            from analyzer.copilot_client import chat_with_tools
-            from db.store import get_setting as gs
-            from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-            import oracledb
-            conn_ora = None
-            try:
-                _dsn  = gs('oracle_dsn',  ORACLE_DSN)
-                _user = gs('oracle_user', ORACLE_USER)
-                _pwd  = gs('oracle_password', ORACLE_PASSWORD)
-                conn_ora = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-            except Exception:
-                pass
-
-            # Boucle outil (max 10 tours en chat)
-            MAX_ROUNDS = 10
-            rounds = 0
-            raw = ""
-            usage = {}
-            while rounds < MAX_ROUNDS:
-                rounds += 1
-                text, tool_calls, u = chat_with_tools(
-                    messages=messages, tools=TOOLS_SCHEMA,
-                    model=ai_model, max_tokens=3000, system=CHAT_SYSTEM,
-                )
-                for k, v in (u or {}).items():
-                    if isinstance(v, (int, float)):
-                        usage[k] = usage.get(k, 0) + v
-                if text:
-                    raw = text
-                if not tool_calls:
-                    break
-                # Exécuter les outils et continuer
-                messages.append({
-                    "role": "assistant", "content": text,
-                    "tool_calls": [{"id": tc["id"], "type": "function",
-                                    "function": {"name": tc["name"], "arguments": __import__('json').dumps(tc["arguments"])}} for tc in tool_calls]
-                })
-                for tc in tool_calls:
-                    if conn_ora:
-                        result = execute_tool_native(conn_ora, tc["name"], tc["arguments"])
-                    else:
-                        result = {"error": "Oracle non disponible"}
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": __import__('json').dumps(result, default=str, ensure_ascii=True)})
-            if conn_ora:
-                try: conn_ora.close()
-                except Exception: pass
-        else:
-            raw, usage = _copilot_client.chat(
-                messages=messages,
-                model=ai_model,
-                max_tokens=3000,
-                system=CHAT_SYSTEM,
+        from analyzer.oracle_tools import get_tools_schema_filtered, execute_tool_native
+        from analyzer.copilot_client import chat_with_tools
+        try:
+            conn_ora = connect_oracle(
+                user=get_setting("oracle_user", ORACLE_USER),
+                password=get_setting("oracle_password", ORACLE_PASSWORD),
+                dsn=get_setting("oracle_dsn", ORACLE_DSN),
             )
+        except Exception:
+            pass
+        tools = get_tools_schema_filtered()
+        raw = ""
+        usage = {}
+        for round_index in range(11):
+            text, tool_calls, round_usage = chat_with_tools(
+                messages=messages, tools=tools if round_index < 10 else [],
+                model=ai_model, max_tokens=3000, system=CHAT_SYSTEM,
+            )
+            for key, value in (round_usage or {}).items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+            if text:
+                raw = text
+            if not tool_calls or round_index == 10:
+                break
+            messages.append({
+                "role": "assistant", "content": text,
+                "tool_calls": [{"id": call["id"], "type": "function", "function": {
+                    "name": call["name"], "arguments": json.dumps(call["arguments"])
+                }} for call in tool_calls],
+            })
+            for call in tool_calls:
+                result = execute_tool_native(conn_ora, call["name"], call["arguments"]) if conn_ora else {"error": "Oracle non disponible"}
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": json.dumps(result, default=str, ensure_ascii=True)})
     except Exception as e:
         import logging
         logging.getLogger("oracleiq").exception("Chat IA echoue pour %s", query_id)
@@ -1324,10 +1338,8 @@ async def settings_page(request: Request):
         return RedirectResponse("/settings/login", status_code=303)
     settings = {
         "analyzer_mode":    get_setting("analyzer_mode", "manual"),
-        "analyzer_ai_mode": get_setting("analyzer_ai_mode", "classic"),
-        "tool_rounds":      int(get_setting("tool_rounds", "3")),
+        "analyzer_ai_mode": "native",
         "collector_active": get_setting("collector_active", "true") == "true",
-        "thinking_budget":  int(get_setting("thinking_budget", "1024")),
         "ai_model":         get_setting("ai_model", "claude-sonnet-4.6"),
         "ai_max_tokens":    int(get_setting("ai_max_tokens", "8000")),
         "plan_truncate":    int(get_setting("plan_truncate", "3000")),
@@ -1352,7 +1364,7 @@ async def dashboard(request: Request):
         "request": request,
         "stats": stats,
         "is_admin": _is_admin(request),
-        "analyzer_ai_mode": get_setting("analyzer_ai_mode", "classic"),
+        "analyzer_ai_mode": "native",
     })
 
 
@@ -1372,6 +1384,6 @@ async def query_detail_page(request: Request, query_id: int):
     return templates.TemplateResponse(request=request, name="query_detail.html", context={
         "request": request,
         "is_admin": _is_admin(request),
-        "analyzer_ai_mode": get_setting("analyzer_ai_mode", "classic"),
+        "analyzer_ai_mode": "native",
         **detail,
     })
