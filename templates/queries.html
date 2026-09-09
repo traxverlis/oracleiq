@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ODIN — Requêtes Oracle</title>
+  <link rel="stylesheet" href="/static/css/main.css?v=2">
+  <link rel="stylesheet" href="/static/css/responsive.css">
+  <script defer src="/static/vendor/lucide.js"></script>
+  <script defer src="/static/js/common.js"></script>
+  <script defer src="/static/js/dashboard.js"></script>
+</head>
+<body data-admin="{{ 'true' if is_admin else 'false' }}">
+  <a class="skip-link" href="#main">Aller aux requêtes</a>
+  <nav class="navbar" aria-label="Navigation principale">
+    <a class="nav-brand" href="/">🔮 ODI<span class="nav-title-iq">N</span></a>
+    <span class="nav-sub">Requêtes Oracle</span>
+    <span id="statusCollectorNav" class="nav-status-pill">Connexion…</span>
+    <span id="statusModeNav" class="nav-status-pill"></span>
+    <span class="nav-spacer"></span>
+    <div class="nav-actions">
+      {% if is_admin %}
+      <button class="nav-btn nav-btn-primary" id="analyzeAll"><i data-lucide="scan-search" aria-hidden="true"></i>Analyser tout</button>
+      <button class="nav-btn icon-btn" id="openPurge" title="Purger les données" aria-label="Purger les données"><i data-lucide="trash-2"></i></button>
+      {% endif %}
+      <a class="nav-btn" href="/settings" title="Administration"><i data-lucide="settings" aria-hidden="true"></i>Administration</a>
+      {% if is_admin or request.cookies.get('odin_admin') %}
+      <a class="nav-btn icon-btn" href="/settings/logout" title="Déconnexion" aria-label="Déconnexion"><i data-lucide="log-out"></i></a>
+      {% endif %}
+    </div>
+  </nav>
+  <main class="container" id="main">
+    <header class="page-heading"><h1>Requêtes</h1><span id="updatedAt" class="meta-item"></span></header>
+    <div class="stats-bar" aria-label="Indicateurs globaux">
+      <div class="stat-card"><span class="stat-num" id="totalQueries">{{ stats.total_queries }}</span><span class="stat-label">Requêtes capturées</span></div>
+      <div class="stat-card"><span class="stat-num" id="analyzedQueries">{{ stats.analyzed }}</span><span class="stat-label">Analysées par IA</span></div>
+      <div class="stat-card critical"><span class="stat-num" id="criticalQueries">{{ stats.critical }}</span><span class="stat-label">Critiques</span></div>
+      <div class="stat-card"><span class="stat-num" id="avgScoreVal">{{ stats.avg_score if stats.avg_score is not none else '—' }}</span><span class="stat-label">Score moyen / 100</span></div>
+    </div>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <form class="toolbar" id="filters" role="search">
+      <div class="toolbar-group toolbar-search">
+        <div class="search-wrap"><i class="search-icon" data-lucide="search" aria-hidden="true"></i><input id="searchInput" type="search" aria-label="Rechercher dans le SQL complet, schéma, module ou SQL ID" placeholder="SQL, schéma, module, SQL ID…" maxlength="500"></div>
+        <select id="schemaFilter" class="toolbar-select" aria-label="Schéma"><option value="">Tous les schémas</option></select>
+        <select id="sortSelect" class="toolbar-select" aria-label="Trier par"><option value="elapsed">Temps moyen</option><option value="executions">Exécutions</option><option value="score">Score IA</option><option value="severity">Sévérité</option><option value="buffer">Buffer gets</option><option value="last_seen">Dernière capture</option></select>
+      </div>
+      <div class="toolbar-group toolbar-filters">
+        <label class="toggle-pill"><input type="checkbox" id="criticalOnly">Critiques</label>
+        <label class="toggle-pill"><input type="checkbox" id="groupByPattern">Par pattern</label>
+        <button class="nav-btn icon-btn" type="button" id="resetFilters" title="Réinitialiser les filtres" aria-label="Réinitialiser les filtres"><i data-lucide="filter-x"></i></button>
+      </div>
+    </form>
+    <div class="table-wrap" tabindex="0" aria-label="Liste des requêtes" id="tableRegion">
+      <table id="queriesTable">
+        <colgroup><col style="width:42px"><col style="width:108px"><col style="width:68px"><col><col style="width:110px"><col style="width:86px"><col style="width:100px"><col style="width:108px"><col><col style="width:124px"></colgroup>
+        <thead><tr>
+          <th><input type="checkbox" id="selectAll" aria-label="Sélectionner la page"></th>
+          <th aria-sort="none"><button data-sort="severity">Sévérité</button></th>
+          <th aria-sort="none"><button data-sort="score">Score</button></th>
+          <th>SQL</th>
+          <th aria-sort="none"><button data-sort="schema">Schéma</button></th>
+          <th aria-sort="none"><button data-sort="executions">Exéc.</button></th>
+          <th aria-sort="descending"><button data-sort="elapsed">Moy. (ms)</button></th>
+          <th aria-sort="none"><button data-sort="buffer">Buffer gets</button></th>
+          <th>Dernière analyse</th><th>Actions</th>
+        </tr></thead>
+        <tbody><tr><td colspan="10" class="empty-state">Chargement…</td></tr></tbody>
+      </table>
+    </div>
+    <footer class="pagination" aria-label="Pagination">
+      <span id="rowCount" role="status"></span>
+      <label>Lignes <select id="pageSize" aria-label="Lignes par page"><option>25</option><option selected>50</option><option>100</option></select></label>
+      <div class="page-controls"><button class="nav-btn icon-btn" id="previousPage" title="Page précédente" aria-label="Page précédente"><i data-lucide="chevron-left"></i></button><span id="pageLabel">1 / 1</span><button class="nav-btn icon-btn" id="nextPage" title="Page suivante" aria-label="Page suivante"><i data-lucide="chevron-right"></i></button></div>
+    </footer>
+  </main>
+  <div id="selectionBar" class="selection-bar" hidden>
+    <span id="selectionCount"></span>
+    <button class="sel-btn" id="exportSelection"><i data-lucide="download" aria-hidden="true"></i>PDF</button>
+    {% if is_admin %}<button class="sel-btn" id="analyzeSelection"><i data-lucide="scan-search" aria-hidden="true"></i>Analyser</button>{% endif %}
+    <button class="sel-btn icon-btn" id="clearSelection" title="Désélectionner" aria-label="Désélectionner"><i data-lucide="x"></i></button>
+  </div>
+  {% if is_admin %}
+  <dialog id="purgeDialog" class="action-dialog">
+    <form method="dialog"><h2>Purger les données</h2><p>Cette suppression est irréversible.</p>
+      <label for="purgeScope">Données à supprimer</label>
+      <select id="purgeScope"><option value="analyses">Analyses IA et conversations</option><option value="analyzed">Requêtes déjà analysées</option><option value="all">Toutes les requêtes et leurs données</option></select>
+      <div class="dialog-actions"><button class="nav-btn" value="cancel">Annuler</button><button type="button" class="nav-btn danger" id="confirmPurge">Supprimer</button></div>
+    </form>
+  </dialog>
+  {% endif %}
+</body>
+</html>

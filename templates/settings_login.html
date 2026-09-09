@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ODIN — Accès Administration</title>
+<link rel="stylesheet" href="/static/css/main.css?v=login1">
+<style>
+  .login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .login-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 40px 44px;
+    width: min(360px, calc(100vw - 32px));
+    box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    text-align: center;
+  }
+  .login-logo {
+    font-size: 28px;
+    font-weight: 800;
+    letter-spacing: -1px;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+  .login-logo span { color: var(--accent2); }
+  .login-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 32px;
+  }
+  .login-label {
+    display: block;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .5px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .login-input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    margin-bottom: 20px;
+    box-sizing: border-box;
+    transition: border-color .2s;
+  }
+  .login-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .login-btn {
+    width: 100%;
+    padding: 11px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  .login-btn:hover { opacity: .85; }
+  .login-error {
+    background: rgba(239,68,68,.1);
+    border: 1px solid rgba(239,68,68,.3);
+    color: var(--red);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    margin-bottom: 18px;
+    text-align: left;
+  }
+  .login-lock { font-size: 36px; margin-bottom: 16px; }
+</style>
+<link rel="stylesheet" href="/static/css/responsive.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-lock">🔐</div>
+    <div class="login-logo">🔮 ODI<span>N</span></div>
+    <div class="login-sub">Connexion</div>
+
+    {% if error %}
+    <div class="login-error">⚠️ {{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/settings/login">
+      <label class="login-label" for="password">Mot de passe</label>
+      <input class="login-input" type="password" id="password" name="password"
+             placeholder="••••••••" autofocus autocomplete="current-password">
+      <button class="login-btn" type="submit">Se connecter →</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>

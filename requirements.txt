@@ -1,0 +1,11 @@
+oracledb>=2.0.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+jinja2>=3.1.0
+python-multipart>=0.0.9
+rich>=13.7.0
+openai>=1.30.0
+anthropic>=0.28.0
+requests>=2.32.0,<3
+pydantic>=2.7,<3
+httpx>=0.27,<1

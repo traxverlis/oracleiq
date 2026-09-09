@@ -1,0 +1,16 @@
+{
+  "name": "odin-ui",
+  "private": true,
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "dompurify": "3.4.15",
+    "lucide": "1.43.0",
+    "marked": "18.0.12"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

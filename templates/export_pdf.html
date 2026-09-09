@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>ODIN — Rapport d'analyse</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="/static/vendor/marked.js"></script>
+<script src="/static/vendor/purify.js"></script>
+<script src="/static/js/common.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, Arial, sans-serif;
+    font-size: 12px; color: #1a1a2e; margin: 0; padding: 0;
+    background: #fff;
+  }
+
+  /* ─── Barre d'impression (masquée à l'impression) ─── */
+  .print-bar {
+    background: #1e1e3a; color: #e2e8f0; padding: 12px 24px;
+    display: flex; align-items: center; gap: 16px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .print-bar h1 { margin: 0; font-size: 18px; color: #a5b4fc; }
+  .print-bar .meta { font-size: 12px; color: #94a3b8; flex: 1; }
+  .print-btn {
+    padding: 8px 20px; border-radius: 8px; border: none; cursor: pointer;
+    background: #6366f1; color: #fff; font-size: 13px; font-weight: 600;
+  }
+  .print-btn:hover { background: #4f46e5; }
+  .back-btn {
+    color: #94a3b8; text-decoration: none; font-size: 13px;
+    padding: 6px 12px; border: 1px solid #334155; border-radius: 6px;
+  }
+  .back-btn:hover { color: #e2e8f0; }
+
+  /* ─── Contenu ─── */
+  .report { max-width: 900px; margin: 0 auto; padding: 24px; }
+
+  .cover {
+    text-align: center; padding: 40px 0 32px;
+    border-bottom: 2px solid #e2e8f0; margin-bottom: 32px;
+  }
+  .cover h1 { font-size: 28px; color: #1e1e3a; margin: 0 0 8px; }
+  .cover .subtitle { font-size: 14px; color: #64748b; }
+  .cover .badge-count {
+    display: inline-block; margin-top: 16px;
+    background: #ede9fe; color: #6366f1; padding: 6px 20px;
+    border-radius: 20px; font-weight: 600; font-size: 14px;
+  }
+
+  /* ─── Entrée de requête ─── */
+  .query-entry {
+    margin-bottom: 40px; page-break-inside: avoid;
+    border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;
+  }
+  .query-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .query-num { font-size: 11px; color: #94a3b8; font-weight: 500; }
+  .query-schema {
+    background: #ede9fe; color: #6d28d9;
+    padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .severity-badge {
+    padding: 3px 12px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  }
+  .severity-critical { background: #fee2e2; color: #dc2626; }
+  .severity-warning  { background: #fef9c3; color: #ca8a04; }
+  .severity-ok       { background: #dcfce7; color: #16a34a; }
+  .severity-pending  { background: #f1f5f9; color: #64748b; }
+  .score-circle {
+    width: 44px; height: 44px; border-radius: 50%; border: 3px solid;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 14px; margin-left: auto;
+  }
+  .score-ok       { border-color: #16a34a; color: #16a34a; }
+  .score-warning  { border-color: #ca8a04; color: #ca8a04; }
+  .score-critical { border-color: #dc2626; color: #dc2626; }
+  .score-none     { border-color: #94a3b8; color: #94a3b8; }
+
+  .query-body { padding: 16px 20px; }
+
+  /* Stats */
+  .stats-row {
+    display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .stat-pill {
+    background: #f1f5f9; border-radius: 8px; padding: 6px 14px;
+    font-size: 11px; color: #475569;
+  }
+  .stat-pill strong { color: #1e293b; }
+  .stat-pill.slow { background: #fee2e2; color: #dc2626; }
+
+  /* SQL */
+  .sql-block {
+    background: #1e1e3a; color: #e2e8f0; padding: 14px 16px;
+    border-radius: 8px; font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 11px; white-space: pre-wrap; word-break: break-all;
+    margin: 12px 0; max-height: 200px; overflow: auto; line-height: 1.5;
+  }
+
+  /* Analyse IA */
+  .ai-section { margin-top: 16px; }
+  .ai-label {
+    font-size: 10px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: #94a3b8; margin-bottom: 8px;
+  }
+  .summary-box {
+    background: #eff6ff; border-left: 3px solid #6366f1;
+    padding: 10px 14px; border-radius: 0 8px 8px 0;
+    font-style: italic; color: #1e3a8a; font-size: 12px;
+    margin-bottom: 12px;
+  }
+
+  /* Markdown */
+  .ai-content h1, .ai-content h2, .ai-content h3 {
+    margin: 12px 0 6px; color: #1e1e3a; font-size: 13px;
+  }
+  .ai-content h1 { font-size: 15px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
+  .ai-content ul, .ai-content ol { margin: 6px 0 6px 20px; padding: 0; }
+  .ai-content li { margin-bottom: 4px; line-height: 1.5; }
+  .ai-content code {
+    background: #f1f5f9; padding: 1px 5px; border-radius: 4px;
+    font-family: monospace; font-size: 11px;
+  }
+  .ai-content pre code {
+    background: #1e1e3a; color: #e2e8f0; display: block; padding: 10px;
+    border-radius: 6px; white-space: pre-wrap;
+  }
+  .ai-content strong { color: #1e293b; }
+  .ai-content table {
+    border-collapse: collapse; width: 100%; margin: 8px 0;
+  }
+  .ai-content th { background: #f1f5f9; padding: 6px 10px; text-align: left; font-size: 11px; }
+  .ai-content td { padding: 5px 10px; border-bottom: 1px solid #f1f5f9; font-size: 11px; }
+
+  .tokens-info { font-size: 10px; color: #94a3b8; margin-top: 8px; }
+  .no-analysis {
+    background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px;
+    padding: 20px; text-align: center; color: #94a3b8; font-style: italic;
+    margin-top: 12px;
+  }
+
+  /* Séparateur de page */
+  .page-break { page-break-before: always; }
+
+  /* ─── Print ─── */
+  @media print {
+    .print-bar { display: none !important; }
+    body { font-size: 11px; }
+    .report { padding: 0; max-width: 100%; }
+    .cover { padding: 20px 0; }
+    .query-entry { break-inside: avoid; border: 1px solid #ccc; }
+    .sql-block { max-height: none; }
+    @page { margin: 1.5cm; size: A4; }
+  }
+</style>
+</head>
+<body>
+
+<div class="print-bar">
+  <h1>🔮 ODIN</h1>
+  <span class="meta">Rapport généré le {{ generated_at }} — {{ count }} requête(s)</span>
+  <a href="/" class="back-btn">← Retour</a>
+  <button class="print-btn" onclick="window.print()">🖨️ Imprimer / PDF</button>
+</div>
+
+<div class="report">
+  <div class="cover">
+    <h1>Rapport d'analyse Oracle</h1>
+    <div class="subtitle">Généré par ODIN le {{ generated_at }}</div>
+    <div class="badge-count">{{ count }} requête(s) analysée(s)</div>
+  </div>
+
+  {% for item in items %}
+  <div class="query-entry{% if not loop.first and loop.index0 % 3 == 0 %} page-break{% endif %}">
+    <div class="query-header">
+      <span class="query-num">#{{ item.id }}</span>
+      {% if item.schema_name %}
+      <span class="query-schema">{{ item.schema_name }}</span>
+      {% endif %}
+      {% set sev = item.severity or 'pending' %}
+      <span class="severity-badge severity-{{ sev }}">
+        {% if sev == 'critical' %}🔴 Critique
+        {% elif sev == 'warning' %}🟡 Warning
+        {% elif sev == 'ok' %}🟢 OK
+        {% else %}⏳ Non analysée{% endif %}
+      </span>
+      {% if item.analyzed_at %}
+      <span style="font-size:10px;color:#94a3b8;">{{ item.analyzed_at[:16] }} UTC | {{ item.model_used or '' }}</span>
+      {% endif %}
+      {% if item.perf_score is not none %}
+      {% set sc = item.perf_score %}
+      <div class="score-circle {{ 'score-ok' if sc >= 80 else ('score-warning' if sc >= 50 else 'score-critical') }}">
+        {{ sc }}
+      </div>
+      {% else %}
+      <div class="score-circle score-none">–</div>
+      {% endif %}
+    </div>
+
+    <div class="query-body">
+      <!-- Stats -->
+      <div class="stats-row">
+        <div class="stat-pill"><strong>Exéc.</strong> {{ item.executions or 0 }}</div>
+        <div class="stat-pill {{ 'slow' if (item.elapsed_ms_avg or 0) > 1000 else '' }}">
+          <strong>Moy</strong> {{ "%.1f"|format(item.elapsed_ms_avg or 0) }} ms
+        </div>
+        <div class="stat-pill"><strong>Pic de moyenne</strong> {{ "%.1f"|format(item.elapsed_ms_max or 0) }} ms</div>
+        <div class="stat-pill"><strong>Buffer gets</strong> {{ "%d"|format(item.buffer_gets_avg or 0) }}</div>
+        <div class="stat-pill"><strong>Disk reads</strong> {{ "%d"|format(item.disk_reads_avg or 0) }}</div>
+      </div>
+
+      <!-- SQL -->
+      <div class="ai-label">SQL</div>
+      <div class="sql-block" id="sql-{{ item.id }}">{{ item.sql_text }}</div>
+
+      <!-- Analyse IA -->
+      {% if item.raw_response %}
+      <div class="ai-section">
+        {% if item.summary %}
+        <div class="ai-label">Résumé</div>
+        <div class="summary-box">{{ item.summary }}</div>
+        {% endif %}
+        <div class="ai-label">Analyse complète</div>
+        <div class="ai-content" id="ai-{{ item.id }}" data-raw="{{ item.raw_response | e }}"></div>
+        {% if item.tokens_in or item.tokens_out %}
+        <div class="tokens-info">🔢 Tokens : {{ item.tokens_in or 0 }} in / {{ item.tokens_out or 0 }} out</div>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="no-analysis">Pas encore analysée par l'IA</div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+// Rendre le markdown de chaque analyse
+document.querySelectorAll('.ai-content[data-raw]').forEach(el => {
+  const raw = el.getAttribute('data-raw');
+  // Supprimer les lignes de métadonnées (SCORE:/SEVERITY:/SUMMARY:) pour le corps
+  const body = raw.replace(/^(SCORE|SEVERITY|SUMMARY):.*$/gm, '').trim();
+  el.innerHTML = safeMarkdown(body);
+});
+</script>
+</body>
+</html>

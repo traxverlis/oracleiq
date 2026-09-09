@@ -1,0 +1,138 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+_database = tempfile.TemporaryDirectory()
+os.environ["ODIN_DB_PATH"] = str(Path(_database.name) / "test.db")
+
+from fastapi.testclient import TestClient
+from db import store
+store.DB_PATH = Path(os.environ["ODIN_DB_PATH"])
+from api.app import app
+from api import security
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        self.client.cookies.set(security.COOKIE_NAME, security.make_token())
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_sensitive_routes_require_admin(self):
+        self.client.cookies.clear()
+        for path in ("/api/settings/collector_active", "/api/settings/test_oracle",
+                     "/api/queries/1/replay", "/api/analyze/1", "/api/queries/1/chat"):
+            self.assertEqual(self.client.post(path, json={}).status_code, 403, path)
+
+    def test_health_is_admin_only_even_with_public_read(self):
+        response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("collector", response.json()["services"])
+        self.assertNotIn("oracle_password", response.text)
+        with patch.object(security, "PUBLIC_READ", True):
+            self.client.cookies.clear()
+            self.assertEqual(self.client.get("/api/health").status_code, 403)
+            self.assertEqual(self.client.get("/api/settings").status_code, 403)
+            self.client.cookies.set(security.COOKIE_NAME, security.make_token("viewer"))
+            self.assertEqual(self.client.get("/api/health").status_code, 403)
+            self.assertEqual(self.client.get("/api/settings").status_code, 403)
+
+    def test_model_catalog_refresh_preserves_settings_and_cache_on_failure(self):
+        import json
+        catalog = [{"id": "new-model", "name": "New model", "vendor": "Vendor"}]
+        with patch("config.AI_PROVIDER", "github-copilot"), patch("api.app.set_setting") as save:
+            with patch("api.app._copilot_client.list_account_models", return_value=catalog):
+                response = self.client.post("/api/models/refresh")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["models"], catalog)
+                self.assertEqual(save.call_args.args[0], "copilot_model_catalog")
+                self.assertEqual(json.loads(save.call_args.args[1])["models"], catalog)
+            save.reset_mock()
+            with patch("api.app._copilot_client.list_account_models", side_effect=RuntimeError("private token")):
+                response = self.client.post("/api/models/refresh")
+                self.assertEqual(response.status_code, 502)
+                self.assertNotIn("private token", response.text)
+                save.assert_not_called()
+        with patch.object(security, "PUBLIC_READ", True):
+            self.client.cookies.clear()
+            self.assertEqual(self.client.get("/api/models").status_code, 403)
+            self.assertEqual(self.client.post("/api/models/refresh").status_code, 403)
+
+    def test_pages_render_with_installed_starlette(self):
+        for path in ("/settings/login", "/", "/settings"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+
+    def test_settings_validation_and_password_redaction(self):
+        self.assertEqual(self.client.post("/api/settings", json={"tool_rounds": -1}).status_code, 422)
+        self.assertEqual(self.client.post("/api/settings", json={"analyzer_mode": "invalid"}).status_code, 422)
+        with patch("api.app.set_setting") as save:
+            result = self.client.post("/api/settings", json={"oracle_password": "synthetic", "gather_stats_enabled": False})
+            self.assertEqual(result.status_code, 200)
+            self.assertNotIn("synthetic", result.text)
+            save.assert_any_call("gather_stats_enabled", "false")
+
+    def test_bulk_analysis_uses_bounded_executor(self):
+        query_id = store.upsert_query({"sql_id": "bulk1", "sql_text": "select 1 from dual", "sql_hash": "bulk1", "schema_name": "APP"})
+        from api.app import analyzing_ids
+        try:
+            with patch("api.app._analysis_executor.submit") as submit:
+                result = self.client.post("/api/analyze/all", json={})
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertEqual(result.json()["queued"], 1)
+                submit.assert_called_once()
+                self.assertEqual(self.client.post(f"/api/analyze/{query_id}").json()["status"], "already_analyzing")
+                submit.assert_called_once()
+                self.assertEqual(self.client.delete(f"/api/queries/{query_id}").status_code, 409)
+        finally:
+            store.analyzing_queue_remove(query_id)
+            analyzing_ids.discard(query_id)
+            store.delete_query_data(query_id)
+
+    def test_comparison_reads_validate_query_and_parameters(self):
+        query_id = store.upsert_query({"sql_id": "comparison", "sql_text": "select 1 from dual", "sql_hash": "comparison"})
+        try:
+            self.assertEqual(self.client.get(f"/api/queries/{query_id}/performance?minutes=14").status_code, 422)
+            self.assertEqual(self.client.get("/api/queries/-1/performance").status_code, 404)
+            self.assertEqual(self.client.get(f"/api/queries/{query_id}/plan-comparison?before_id=1").status_code, 422)
+            self.assertEqual(self.client.get(f"/api/queries/{query_id}/plan-comparison?before_id=999999&after_id=999998").status_code, 404)
+            self.client.cookies.set(security.COOKIE_NAME, security.make_token("viewer"))
+            self.assertEqual(self.client.get(f"/api/queries/{query_id}/performance?minutes=60").json()["current"]["state"], "insufficient")
+            self.assertEqual(self.client.get(f"/api/queries/{query_id}/plan-comparison").json()["plans"], [])
+        finally:
+            store.delete_query_data(query_id)
+
+    def test_bind_read_never_connects_and_refresh_requires_admin(self):
+        query_id = store.upsert_query({"sql_id": "bindread", "sql_text": "select :id from dual", "sql_hash": "bindread"})
+        try:
+            with patch("api.app.connect_oracle") as connect:
+                response = self.client.get(f"/api/queries/{query_id}/binds")
+                self.assertEqual(response.json()["source"], "sqlite")
+                connect.assert_not_called()
+                with patch("analyzer.oracle_tools.bind_captures", return_value={"captured": False, "binds": []}):
+                    response = self.client.post(f"/api/queries/{query_id}/binds/refresh")
+                    self.assertEqual(response.status_code, 200)
+                    connect.assert_called_once()
+                    connect.return_value.close.assert_called_once()
+            self.client.cookies.set(security.COOKIE_NAME, security.make_token("viewer"))
+            self.assertEqual(self.client.post(f"/api/queries/{query_id}/binds/refresh").status_code, 403)
+        finally:
+            store.delete_query_data(query_id)
+
+    def test_refresh_targets_child_cursor(self):
+        query_id = store.upsert_query({"sql_id": "childtest", "sql_text": "select 1 from dual", "sql_hash": "child", "schema_name": "APP", "child_number": 7})
+        try:
+            with patch("api.app.connect_oracle"), patch("api.app.get_setting", return_value="fixture"), patch("collector.oracle_collector.get_execution_plan", return_value="Plan hash value: 123") as plan:
+                response = self.client.post(f"/api/refresh_plan/{query_id}")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(plan.call_args.args[2], 7)
+        finally:
+            store.delete_query_data(query_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

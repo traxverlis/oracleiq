@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ODIN — Détail requête</title>
+<link rel="stylesheet" href="/static/css/main.css?v=1786121574">
+<link rel="stylesheet" href="/static/css/responsive.css">
+<script src="/static/vendor/marked.js"></script>
+<script src="/static/vendor/purify.js"></script>
+<script src="/static/js/common.js"></script>
+<script defer src="/static/vendor/lucide.js"></script>
+<script defer src="/static/js/query-performance.js"></script>
+</head>
+<body data-admin="{{ 'true' if is_admin else 'false' }}" data-query-id="{{ query.id }}" class="query-detail">
+<nav class="navbar">
+  <div class="nav-brand"><a href="/" style="color:inherit;text-decoration:none">🔮 ODI<span class="nav-title-iq">N</span></a></div>
+  <div class="nav-sub">Détail de la requête #{{ query.id }}</div>
+  <a href="/settings" class="nav-settings" title="Paramètres">⚙️ Paramètres</a>
+</nav>
+
+<div class="container">
+  <a href="/" class="back-btn">← Retour au dashboard</a>
+
+  <!-- En-tête -->
+  <div class="detail-header">
+    <div class="detail-meta">
+      <span class="schema-tag big">{{ query.schema_name or 'UNKNOWN' }}</span>
+      {% if query.module %}<span class="module-tag">{{ query.module }}</span>{% endif %}
+      <span class="meta-item">{{ query.executions }} exécutions</span>
+      <span class="meta-item">Dernière vue : <span data-utc="{{ query.last_seen }}">{{ query.last_seen }}</span></span>
+    </div>
+    <div class="detail-actions">
+      {% if analysis %}
+      <div class="score-big score-{{ 'ok' if analysis.perf_score >= 80 else ('warning' if analysis.perf_score >= 50 else 'critical') }}">
+        {{ analysis.perf_score }}<span>/100</span>
+      </div>
+      {% endif %}
+      <div class="reanalyze-btns">
+        <button id="btnAnalyze" class="btn-reanalyze" onclick="reanalyze()">
+          🔄 {% if analysis %}Re-analyser{% else %}Analyser{% endif %}
+        </button>
+      </div>
+      <div id="analyzeStatus" class="analyze-status" style="display:none">⏳ Analyse en cours...</div>
+      <div id="analyzeProgress" class="analyze-progress" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- Alertes -->
+  {% if query.analysis_error %}<div class="notice notice-error" role="alert">{{ query.analysis_error }}</div>{% endif %}
+  {% if query.plan_change_detected %}
+  <div class="alert alert-warning">
+    ⚠️ Le plan d'exécution a changé depuis la dernière capture
+    <button class="btn-sm" onclick="resetPlanChange()" style="margin-left:12px">Marquer comme vu</button>
+  </div>
+  {% endif %}
+  {% if query.has_literal_values %}
+  <div class="alert alert-info">
+    ⚠️ Cette requête contient des valeurs littérales hardcodées. Utilisez des bind variables (:param) pour améliorer les performances du shared pool Oracle.
+  </div>
+  {% endif %}
+
+  <!-- SQL -->
+  <section class="card">
+    <h2>📝 Requête SQL</h2>
+    <pre class="sql-full">{{ query.sql_text }}</pre>
+  </section>
+
+  <!-- Métriques -->
+  <section class="card">
+    <h2>📊 Métriques d'exécution</h2>
+    <div class="metrics-grid">
+      <div class="metric {{ 'metric-bad' if query.elapsed_ms_avg > 1000 else ('metric-warn' if query.elapsed_ms_avg > 200 else 'metric-ok') }}">
+        <div class="metric-val">{{ "%.1f"|format(query.elapsed_ms_avg or 0) }} ms</div>
+        <div class="metric-label">Temps moyen</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val">{{ "%.1f"|format(query.elapsed_ms_max or 0) }} ms</div>
+        <div class="metric-label">Pic de moyenne</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val">{{ "%d"|format(query.buffer_gets_avg or 0) }}</div>
+        <div class="metric-label">Buffer gets moy</div>
+      </div>
+      <div class="metric {{ 'metric-bad' if query.disk_reads_avg > 1000 else '' }}">
+        <div class="metric-val">{{ "%d"|format(query.disk_reads_avg or 0) }}</div>
+        <div class="metric-label">Disk reads moy</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val">{{ "%.1f"|format(query.rows_avg or 0) }}</div>
+        <div class="metric-label">Lignes retournées moy</div>
+      </div>
+      <div class="metric">
+        <div class="metric-val">{{ "%.1f"|format(query.cpu_ms_avg or 0) }} ms</div>
+        <div class="metric-label">CPU moyen</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="performanceSection" aria-labelledby="performanceTitle">
+    <div class="performance-controls">
+      <h2 id="performanceTitle">Performances récentes</h2>
+      <label for="performancePeriod">Période</label>
+      <select id="performancePeriod" class="toolbar-select"><option value="15">15 minutes</option><option value="60">1 heure</option><option value="1440">24 heures</option></select>
+      <button type="button" id="refreshPerformance" class="nav-btn icon-btn" title="Actualiser les mesures" aria-label="Actualiser les mesures"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
+    </div>
+    <p id="performanceStatus" class="comparison-status" role="status">Chargement des mesures…</p>
+    <div class="performance-table-wrap" tabindex="0" aria-label="Comparaison des périodes">
+      <table class="performance-table">
+        <thead><tr><th>Indicateur</th><th>Précédente<span id="previousPeriodDates" class="period-dates"></span></th><th>Récente<span id="currentPeriodDates" class="period-dates"></span></th><th>Variation</th></tr></thead>
+        <tbody id="performanceRows"></tbody>
+      </table>
+    </div>
+    <p id="performanceExclusions" class="comparison-status"></p>
+  </section>
+
+  <!-- Sparkline tendance -->
+  <section class="card" id="sparklineSection">
+    <h2>📈 Historique des moyennes cumulées</h2>
+    <div id="sparklineWrap"><svg id="sparklineSvg" width="100%" height="80" style="display:block"></svg></div>
+    <div id="sparklineMsg" style="color:var(--text-dim);font-size:13px">Chargement des données...</div>
+  </section>
+
+  <!-- Historique des analyses — navigation par onglets -->
+  <section class="card" id="analysisHistoryCard">
+    {% if history %}
+    <h2>🧠 Analyses IA
+      {% if history|length > 1 %}
+      <span class="history-count">{{ history|length }} analyses</span>
+      {% endif %}
+    </h2>
+
+    {% if history|length > 1 %}
+    <!-- Barre de navigation -->
+    <div class="analysis-nav">
+      <button class="analysis-nav-btn" id="btnPrevAnalysis" onclick="navigateAnalysis(-1)">← Précédente</button>
+      <span class="analysis-nav-pos" id="analysisNavPos"></span>
+      <button class="analysis-nav-btn" id="btnNextAnalysis" onclick="navigateAnalysis(1)">Suivante →</button>
+    </div>
+    {% endif %}
+    <!-- Pastilles (affichées même avec une seule analyse pour permettre la suppression) -->
+    {% if history|length >= 1 %}
+    <div class="analysis-pills" id="analysisPills">
+      {% for h in history %}
+      <div class="analysis-pill dot-{{ h.severity or 'pending' }}" data-idx="{{ loop.index0 }}" data-id="{{ h.id }}"
+           onclick="showAnalysis(Number(this.dataset.idx))" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"
+           title="{{ h.analyzed_at[:16] }} — {{ h.perf_score or '?' }}/100" data-utc-title="{{ h.analyzed_at }}">
+        <span class="pill-date" data-utc="{{ h.analyzed_at }}">{{ h.analyzed_at[5:16] }}</span>
+        <span class="pill-score">{{ h.perf_score or '?' }}/100</span>
+        {% if is_admin %}<button class="pill-del" data-id="{{ h.id }}" onclick="deleteAnalysis(event, Number(this.dataset.id))" title="Supprimer cette analyse">×</button>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Zone affichage analyse -->
+    <div id="analysisDisplay"></div>
+
+    <!-- Données JSON -->
+    <script id="analysisHistoryData" type="application/json">{{ history | tojson }}</script>
+
+    {% else %}
+    <h2>🧠 Analyse IA</h2>
+    <p class="pending-msg">Aucune analyse pour cette requête. Cliquez sur "Analyser" ci-dessus.</p>
+    {% endif %}
+  </section>
+
+  <!-- Bind Variables -->
+  <section class="card" id="bindsCard">
+    <h2>🔗 Bind Variables
+      <button class="btn-refresh-plan" id="btnLoadBinds" onclick="loadBinds(true)" title="Charger depuis Oracle">🔄 Charger</button>
+    </h2>
+    <div id="bindsContent">
+      <p class="pending-msg" style="font-size:12px">Cliquez sur « Charger » pour récupérer les dernières valeurs capturées par Oracle.</p>
+    </div>
+  </section>
+
+  <!-- Plan d'exécution -->
+  <section class="card">
+    <h2>🗂️ Plan d'exécution Oracle
+      {% if plan %}<span class="plan-date">{{ plan.captured_at }}</span>{% endif %}
+      <button class="btn-refresh-plan" id="btnRefreshPlan" onclick="refreshPlanOnly()" title="Rafraîchir depuis Oracle">🔄 Rafraîchir</button>
+    </h2>
+    {% if plan %}
+    <pre class="plan-text" id="planText">{{ plan.plan_text }}</pre>
+    {% else %}
+    <div id="planText" class="no-plan">
+      ⚠️ Aucun plan capturé pour cette requête.
+      Cliquez sur <strong>🔄 Rafraîchir</strong> pour le récupérer depuis Oracle,
+      ou lancez une <strong>analyse IA</strong> (le plan est automatiquement rafraîchi avant l’analyse).
+    </div>
+    {% endif %}
+  </section>
+
+  <!-- Replay SQL -->
+  <section class="card">
+    <details id="planComparison">
+      <summary>Comparer les plans capturés</summary>
+      <div class="performance-controls plan-controls">
+        <label for="beforePlan">Référence</label><select id="beforePlan" class="toolbar-select" aria-label="Plan de référence"></select>
+        <label for="afterPlan">Comparaison</label><select id="afterPlan" class="toolbar-select" aria-label="Plan comparé"></select>
+        <button type="button" id="refreshPlanComparison" class="nav-btn icon-btn" title="Actualiser la comparaison" aria-label="Actualiser la comparaison"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
+      </div>
+      <p id="planComparisonStatus" class="comparison-status" role="status"></p>
+      <pre id="planDiff" class="plan-text" aria-label="Différences textuelles des plans" hidden></pre>
+    </details>
+  </section>
+
+  {% set _sql_up = query.sql_text.upper().lstrip() if query.sql_text else '' %}
+  {% if _sql_up.startswith('SELECT') or _sql_up.startswith('WITH') %}
+  <section class="card" id="replaySection">
+    <h2>▶️ Rejouer la requête
+      <span style="font-size:11px;font-weight:400;color:var(--text-dim);margin-left:8px">Exécution directe sur Oracle — lecture seule, max 5 lignes</span>
+    </h2>
+    <div id="replayContent">
+      <p style="font-size:12px;color:var(--text-dim)">Rejouez la requête telle quelle sur Oracle pour obtenir un plan frais et mesurer le temps réel après avoir appliqué les corrections recommandées.</p>
+    </div>
+    <div class="prompt-actions" style="margin-top:10px">
+      <button class="btn-reanalyze" id="btnReplay" onclick="replaySQL()" style="font-size:13px">▶️ Rejouer maintenant</button>
+      <span id="replayStatus" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+  </section>
+  {% endif %}
+
+  <!-- Chat IA par requête -->
+  <section class="card" id="chatSection">
+    <h2>💬 Discussion avec l'IA
+      {% if is_admin %}<button class="btn-chat-clear" onclick="clearChat()" title="Effacer la conversation">🗑️</button>{% endif %}
+      {% if analyzer_ai_mode == 'native' %}<span style="font-size:11px;font-weight:400;color:#e8820c;margin-left:8px">🔧 Mode natif — peut interroger Oracle en direct</span>{% endif %}
+    </h2>
+    <div class="chat-history" id="chatHistory"></div>
+    <div class="chat-input-row">
+      <textarea id="chatInput" class="chat-input" placeholder="Posez une question sur cette requête..." rows="2"
+        onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault(); sendChat();}"></textarea>
+      <button class="btn-chat-send" id="btnChatSend" onclick="sendChat()">Envoyer ↑</button>
+    </div>
+    <div class="chat-hint">Entrée pour envoyer · Maj+Entrée pour sauter une ligne</div>
+  </section>
+
+</div>
+
+<script>
+const QUERY_ID = Number(document.body.dataset.queryId);
+const ANALYZER_AI_MODE = "{{ analyzer_ai_mode }}";
+
+// ── Reset plan change ────────────────────────────────────────────────────
+// ── Bind Variables ─────────────────────────────────────────────
+function loadBinds(refresh = false) {
+  const btn = document.getElementById('btnLoadBinds');
+  const box = document.getElementById('bindsContent');
+  btn.disabled = true;
+  btn.textContent = '⏳ Chargement...';
+  box.textContent = refresh ? 'Interrogation Oracle...' : 'Chargement des captures locales...';
+
+  requestJSON(`/api/queries/${QUERY_ID}/binds${refresh ? '/refresh' : ''}`, { method: refresh ? 'POST' : 'GET' })
+    .then(data => {
+      btn.disabled = false;
+      btn.innerHTML = '🔄 Rafraîchir';
+      if (data.error) {
+        box.textContent = data.error;
+        return;
+      }
+      if (!data.captured) {
+        let html = `<p class="pending-msg" style="font-size:12px">⚠️ ${escapeHTML(data.message)}</p>`;
+        if (data.binds_without_value && data.binds_without_value.length > 0) {
+          html += '<p style="font-size:11px;color:var(--text-dim);margin-top:8px">Bind variables détectées (sans valeur capturée) :</p>';
+          html += '<div class="binds-list">';
+          data.binds_without_value.forEach(b => {
+            html += `<div class="bind-item bind-no-value">`;
+            html += `<span class="bind-name">${escapeHTML(b.name)}</span>`;
+            html += `<span class="bind-type">${escapeHTML(b.datatype || '?')}</span>`;
+            html += `<span class="bind-value bind-empty">non capturé</span>`;
+            html += `</div>`;
+          });
+          html += '</div>';
+        }
+        box.innerHTML = html;
+        return;
+      }
+      let html = `<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px">${escapeHTML(data.note)}</p>`;
+      html += '<div class="binds-list">';
+      data.binds.forEach(b => {
+        const val = b.value !== null && b.value !== undefined ? escapeHTML(b.value) : '<em style="color:var(--text-dim)">NULL</em>';
+        const ts = b.last_captured ? b.last_captured.substring(0, 16) : '';
+        html += `<div class="bind-item">`;
+        html += `<span class="bind-name">${escapeHTML(b.bind_name)}</span>`;
+        html += `<span class="bind-type">${escapeHTML(b.datatype || '?')}</span>`;
+        html += `<span class="bind-value">${val}</span>`;
+        if (ts) html += `<span class="bind-ts">${escapeHTML(ts)}</span>`;
+        html += `</div>`;
+      });
+      html += '</div>';
+      box.innerHTML = html;
+    })
+    .catch(e => {
+      btn.disabled = false;
+      btn.innerHTML = '🔄 Rafraîchir';
+      box.textContent = 'Erreur : ' + e;
+    });
+}
+
+function resetPlanChange() {
+  fetch(`/api/queries/${QUERY_ID}/reset_plan_change`, {method: 'POST'})
+    .then(() => location.reload());
+}
+
+// ── Sparkline SVG ───────────────────────────────────────────────────
+function drawSparkline(snapshots) {
+  const svg = document.getElementById('sparklineSvg');
+  const msg = document.getElementById('sparklineMsg');
+  if (!snapshots || snapshots.length < 2) {
+    msg.textContent = snapshots && snapshots.length === 1 ? 'Un seul point — revenez plus tard pour voir la tendance.' : 'Pas encore de données de tendance.';
+    svg.style.display = 'none';
+    return;
+  }
+  msg.textContent = '';
+  const vals = snapshots.map(s => s.elapsed_ms_avg || 0);
+  const times = snapshots.map(s => s.captured_at);
+  const W = svg.parentElement.offsetWidth || 600;
+  const H = 80;
+  const pad = { l: 50, r: 10, t: 10, b: 20 };
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+  const minV = Math.min(...vals);
+  const maxV = Math.max(...vals);
+  const range = maxV - minV || 1;
+
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('width', W);
+
+  const xScale = i => pad.l + (i / (vals.length - 1)) * innerW;
+  const yScale = v => pad.t + innerH - ((v - minV) / range) * innerH;
+
+  const pts = vals.map((v, i) => `${xScale(i).toFixed(1)},${yScale(v).toFixed(1)}`).join(' ');
+
+  svg.innerHTML = `
+    <polyline points="${pts}" fill="none" stroke="#4f8ef7" stroke-width="2" stroke-linejoin="round"/>
+    ${vals.map((v, i) => `<circle cx="${xScale(i).toFixed(1)}" cy="${yScale(v).toFixed(1)}" r="3" fill="#4f8ef7"/>`).join('')}
+    <text x="${pad.l - 4}" y="${pad.t + 4}" text-anchor="end" fill="#94a3b8" font-size="10">${maxV.toFixed(0)} ms</text>
+    <text x="${pad.l - 4}" y="${pad.t + innerH}" text-anchor="end" fill="#94a3b8" font-size="10">${minV.toFixed(0)} ms</text>
+    <text x="${pad.l}" y="${H - 2}" fill="#94a3b8" font-size="9">${(times[0]||'').slice(11,16)}</text>
+    <text x="${W - pad.r}" y="${H - 2}" text-anchor="end" fill="#94a3b8" font-size="9">${(times[times.length-1]||'').slice(11,16)}</text>
+  `;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  fetch(`/api/queries/${QUERY_ID}/snapshots`)
+    .then(r => r.json())
+    .then(data => drawSparkline(data))
+    .catch(() => {
+      document.getElementById('sparklineMsg').textContent = 'Impossible de charger les données.';
+    });
+});
+
+// ── Replay SQL ──────────────────────────────────────────────────────────────
+function replaySQL() {
+  const btn = document.getElementById('btnReplay');
+  const status = document.getElementById('replayStatus');
+  const content = document.getElementById('replayContent');
+  btn.disabled = true;
+  status.textContent = '⏳ Exécution en cours...';
+  content.innerHTML = '<p style="color:var(--text-dim);font-size:12px">⏳ Envoi à Oracle...</p>';
+
+  fetch('/api/queries/' + QUERY_ID + '/replay', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false;
+      if (!d.ok) {
+        status.textContent = '';
+        content.textContent = d.error || d.detail || 'Exécution refusée';
+        return;
+      }
+      status.textContent = '';
+      let html = '';
+
+      if (d.elapsed_ms !== null && d.elapsed_ms !== undefined) {
+        const color = d.elapsed_ms > 1000 ? 'var(--red)' : d.elapsed_ms > 200 ? 'var(--amber)' : 'var(--green)';
+        html += '<div style="margin-bottom:14px">';
+        html += '<span style="font-size:22px;font-weight:700;color:' + color + '">' + d.elapsed_ms + ' ms</span>';
+        html += '<span style="font-size:12px;color:var(--text-dim);margin-left:8px">' + (d.rows_returned ?? 0) + ' ligne(s) retournée(s) — ' + (d.note || '') + '</span>';
+        html += '</div>';
+      } else if (d.exec_error) {
+        html += '<p style="color:var(--red);font-size:12px">⚠️ Exécution : ' + d.exec_error + '</p>';
+      }
+
+      if (d.sample_rows && d.sample_rows.length > 0 && d.columns && d.columns.length > 0) {
+        const MAX_COLS = 8;
+        const cols = d.columns.slice(0, MAX_COLS);
+        const truncated = d.columns.length > MAX_COLS;
+        html += '<div style="overflow-x:auto;margin-bottom:14px">';
+        html += '<table style="width:100%;border-collapse:collapse;font-size:11px">';
+        html += '<thead><tr>';
+        cols.forEach(c => { html += '<th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);color:var(--text-dim);font-weight:600">' + c + '</th>'; });
+        if (truncated) html += '<th style="padding:4px 8px;color:var(--text-dim)">…</th>';
+        html += '</tr></thead><tbody>';
+        d.sample_rows.forEach(row => {
+          html += '<tr>';
+          cols.forEach(c => {
+            const v = row[c];
+            const disp = (v !== null && v !== undefined) ? v : '<em style="color:var(--text-dim)">NULL</em>';
+            html += '<td style="padding:3px 8px;border-bottom:1px solid var(--border);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (v ?? '') + '">' + disp + '</td>';
+          });
+          if (truncated) html += '<td style="padding:3px 8px;color:var(--text-dim)">…</td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+
+      if (d.plan_text && !d.plan_text.startsWith('[Plan non disponible')) {
+        html += '<details style="margin-top:4px">';
+        html += '<summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--blue);user-select:none">🗂️ Plan d&#39;exécution (EXPLAIN PLAN)</summary>';
+        html += '<pre style="margin-top:8px;font-size:11px;white-space:pre-wrap;overflow-x:auto">' + d.plan_text + '</pre>';
+        html += '</details>';
+      } else if (d.plan_text) {
+        html += '<p style="color:var(--text-dim);font-size:12px">' + d.plan_text + '</p>';
+      }
+
+      content.innerHTML = DOMPurify.sanitize(html || '<p>Requête exécutée avec succès.</p>', { USE_PROFILES: { html: true } });
+    })
+    .catch(e => {
+      btn.disabled = false;
+      status.textContent = '';
+      content.textContent = 'Erreur réseau : ' + e;
+    });
+}
+
+
+// ── Rafraîchir le plan uniquement ──────────────────────────────────────────
+function refreshPlanOnly() {
+  const btn = document.getElementById('btnRefreshPlan');
+  btn.disabled = true; btn.textContent = '⏳ En cours...';
+  fetch('/api/refresh_plan/' + QUERY_ID, {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      btn.disabled = false; btn.textContent = '🔄 Rafraîchir';
+      if (d.ok && d.plan) {
+        const el = document.getElementById('planText');
+        el.textContent = d.plan;
+        el.className = 'plan-text';
+      } else {
+        alert('Plan non disponible : ' + (d.error || 'Oracle non accessible'));
+      }
+    })
+    .catch(() => { btn.disabled = false; btn.textContent = '🔄 Rafraîchir'; });
+}
+
+
+// ── Rendu Markdown ────────────────────────────────────────────────────────────
+function renderMarkdown(raw, containerId) {
+  const container = document.getElementById(containerId);
+  if (!container || !raw) return;
+  const lines = raw.split('\n');
+  let bodyStart = 0;
+  for (let i = 0; i < Math.min(6, lines.length); i++) {
+    if (/^(SCORE:|SEVERITY:|SUMMARY:)/i.test(lines[i].trim())) bodyStart = i + 1;
+    else if (/^---+$/.test(lines[i].trim()) && bodyStart >= 2) { bodyStart = i + 1; break; }
+  }
+  const mdBody = lines.slice(bodyStart).join('\n').trim();
+  if (mdBody) {
+    marked.setOptions({ gfm: true, breaks: true });
+    container.innerHTML = safeMarkdown(mdBody);
+    // Ajouter bouton copier sur chaque bloc de code
+    container.querySelectorAll('pre').forEach(pre => {
+      const code = pre.querySelector('code');
+      if (!code) return;
+      pre.style.position = 'relative';
+      const btn = document.createElement('button');
+      btn.className = 'copy-code-btn';
+      btn.title = 'Copier';
+      btn.textContent = '📋';
+      btn.onclick = () => {
+        const text = code.innerText;
+        const doFeedback = () => { btn.textContent = '✅'; setTimeout(() => btn.textContent = '📋', 2000); };
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(text).then(doFeedback);
+        } else {
+          // Fallback HTTP
+          const ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          try { document.execCommand('copy'); doFeedback(); } catch(e) { btn.textContent = '❌'; }
+          document.body.removeChild(ta);
+        }
+      };
+      pre.appendChild(btn);
+    });
+  }
+}
+
+// ── Chat IA ────────────────────────────────────────────────────────────────
+function renderChatMarkdown(md) {
+  if (!md) return '';
+  marked.setOptions({ gfm: true, breaks: true });
+  return safeMarkdown(md);
+}
+
+function appendMessage(role, content, animate) {
+  const hist = document.getElementById('chatHistory');
+  const div = document.createElement('div');
+  div.className = 'chat-msg chat-' + role;
+  if (role === 'assistant') {
+    div.innerHTML = renderChatMarkdown(content);
+    div.querySelectorAll('pre').forEach(pre => {
+      const code = pre.querySelector('code');
+      if (!code) return;
+      pre.style.position = 'relative';
+      const btn = document.createElement('button');
+      btn.className = 'copy-code-btn';
+      btn.textContent = '📋';
+      btn.onclick = () => {
+        const text = code.innerText;
+        const ok = () => { btn.textContent = '✅'; setTimeout(()=>btn.textContent='📋',2000); };
+        if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(ok);
+        else { const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.focus(); ta.select(); try{document.execCommand('copy');ok();}catch(e){} document.body.removeChild(ta); }
+      };
+      pre.appendChild(btn);
+    });
+  } else {
+    div.textContent = content;
+  }
+  hist.appendChild(div);
+  if (animate) { div.style.opacity='0'; setTimeout(()=>{div.style.transition='opacity .3s'; div.style.opacity='1';},20); }
+  hist.scrollTop = hist.scrollHeight;
+  return div;
+}
+
+function loadChatHistory() {
+  fetch(`/api/queries/${QUERY_ID}/chat`).then(r => r.json()).then(data => {
+    const hist = document.getElementById('chatHistory');
+    hist.innerHTML = '';
+    (data.messages || []).forEach(m => appendMessage(m.role, m.content, false));
+    if (data.messages && data.messages.length > 0) hist.scrollTop = hist.scrollHeight;
+  });
+}
+
+function sendChat() {
+  const input = document.getElementById('chatInput');
+  const btn   = document.getElementById('btnChatSend');
+  const msg   = input.value.trim();
+  if (!msg) return;
+  appendMessage('user', msg, true);
+  input.value = '';
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  const thinking = appendMessage('assistant', '_Réflexion en cours..._', true);
+  const curAnalysis = _analysisHistory.length > 0 ? _analysisHistory[_analysisIdx] : null;
+  fetch(`/api/queries/${QUERY_ID}/chat`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({message: msg, analysis_id: curAnalysis ? curAnalysis.id : null})
+  }).then(r => r.json()).then(data => {
+    thinking.remove();
+    appendMessage('assistant', data.reply || 'Erreur', true);
+    btn.disabled = false; btn.textContent = 'Envoyer ↑';
+  }).catch(() => {
+    thinking.remove();
+    appendMessage('assistant', '❌ Erreur de communication avec l\'IA.', true);
+    btn.disabled = false; btn.textContent = 'Envoyer ↑';
+  });
+}
+
+function clearChat() {
+  if (!confirm('Effacer toute la conversation ?')) return;
+  fetch(`/api/queries/${QUERY_ID}/chat`, {method: 'DELETE'})
+    .then(r => {
+      if (r.status === 403) { window.location = '/settings/login'; return; }
+      document.getElementById('chatHistory').innerHTML = '';
+    });
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  initAnalysisNav();
+  loadChatHistory();
+  loadBinds();  // Charge les bind variables automatiquement
+  // — Récupérer le stream si une analyse native est déjà en cours
+  fetch('/api/stats').then(r => r.json()).then(s => {
+    if ((s.analyzing_ids || []).includes(QUERY_ID)) {
+      const btn = document.getElementById('btnAnalyze');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '\u23f3 Analyse en cours...';
+        btn.classList.add('btn-analyzing');
+      }
+      const status = document.getElementById('analyzeStatus');
+      if (status) status.style.display = 'block';
+      if (ANALYZER_AI_MODE === 'native') {
+        // Rebranche sur le stream SSE existant
+        reanalyzeNative(true);
+      } else {
+        // Mode classic : polling simple
+        if (status) status.textContent = '\u23f3 Analyse en cours...';
+        pollUntilDone();
+      }
+    }
+  }).catch(() => {});
+});
+
+// ── Re-analyser ───────────────────────────────────────────────────────────────
+function reanalyze() {
+  const btn = document.getElementById('btnAnalyze');
+  btn.disabled = true;
+  btn.textContent = '\u23f3 Analyse en cours...';
+  btn.classList.add('btn-analyzing');
+  const status = document.getElementById('analyzeStatus');
+  status.style.display = 'block';
+
+  if (ANALYZER_AI_MODE === 'native') {
+    reanalyzeNative();
+  } else {
+    status.textContent = '\u23f3 Rafra\u00eechissement du plan Oracle + analyse IA...';
+    fetch(`/api/analyze/${QUERY_ID}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    }).then(r => r.json()).then(() => {
+      pollUntilDone();
+    }).catch(() => {
+      status.textContent = '\u274c Erreur';
+      btn.disabled = false;
+      btn.textContent = '\ud83d\udd04 Re-analyser';
+      btn.classList.remove('btn-analyzing');
+    });
+  }
+}
+
+function reanalyzeNative(resumeOnly) {
+  const btn = document.getElementById('btnAnalyze');
+  const status = document.getElementById('analyzeStatus');
+  const progress = document.getElementById('analyzeProgress');
+  progress.style.display = 'block';
+  progress.innerHTML = '';
+  status.textContent = resumeOnly ? '\ud83d\udd04 Reconnexion au stream...' : '\ud83d\udd0c Connexion SSE...';
+
+  const addStep = (icon, text, cls) => {
+    const div = document.createElement('div');
+    div.className = 'progress-step' + (cls ? ' ' + cls : '');
+    div.textContent = icon + ' ' + text;
+    progress.appendChild(div);
+    progress.scrollTop = progress.scrollHeight;
+  };
+
+  const es = new EventSource(`/api/analyze/${QUERY_ID}/stream`);
+  let toolCallCount = 0;
+
+  es.onmessage = (e) => {
+    const evt = JSON.parse(e.data);
+    if (evt.type === 'status') {
+      status.textContent = evt.message;
+      addStep('\u2139\ufe0f', evt.message, 'step-status');
+    } else if (evt.type === 'tool_call') {
+      toolCallCount++;
+      const argsStr = Object.entries(evt.args || {}).map(([k,v]) => `${k}=${v}`).join(', ');
+      addStep('\ud83d\udd27', `[${toolCallCount}] ${evt.name}(${argsStr})`, 'step-tool');
+    } else if (evt.type === 'tool_result') {
+      addStep('\u2514\u2500', evt.preview, 'step-result');
+    } else if (evt.type === 'analysis') {
+      addStep('\u2705', 'Analyse r\u00e9dig\u00e9e', 'step-done');
+    } else if (evt.type === 'done') {
+      status.textContent = `\u2705 Termin\u00e9 — Score ${evt.score}/100 (${evt.severity})`;
+      es.close();
+      btn.disabled = false;
+      btn.textContent = '\ud83d\udd04 Re-analyser';
+      btn.classList.remove('btn-analyzing');
+      setTimeout(() => location.reload(), 1200);
+    } else if (evt.type === 'error') {
+      status.textContent = '\u274c ' + evt.message;
+      addStep('\u274c', evt.message, 'step-error');
+      es.close();
+      btn.disabled = false;
+      btn.textContent = '\ud83d\udd04 Re-analyser';
+      btn.classList.remove('btn-analyzing');
+    }
+  };
+
+  es.onerror = () => {
+    status.textContent = '\u274c Connexion SSE perdue';
+    es.close();
+    btn.disabled = false;
+    btn.textContent = '\ud83d\udd04 Re-analyser';
+    btn.classList.remove('btn-analyzing');
+  };
+}
+
+function pollUntilDone() {
+  fetch('/api/stats').then(r => r.json()).then(s => {
+    if ((s.analyzing_ids || []).includes(QUERY_ID)) {
+      setTimeout(pollUntilDone, 4000);
+    } else {
+      location.reload();
+    }
+  });
+}
+
+// ── Navigation entre analyses ─────────────────────────────────────────────
+let _analysisHistory = [];
+let _analysisIdx = 0;
+
+function initAnalysisNav() {
+  const dataEl = document.getElementById('analysisHistoryData');
+  if (!dataEl) return;
+  _analysisHistory = JSON.parse(dataEl.textContent) || [];
+  if (_analysisHistory.length > 0) showAnalysis(0);
+}
+
+function showAnalysis(idx) {
+  if (idx < 0 || idx >= _analysisHistory.length) return;
+  _analysisIdx = idx;
+
+  // Highlight pastille active
+  document.querySelectorAll('.analysis-pill').forEach((el, i) => {
+    el.classList.toggle('active', i === idx);
+  });
+
+  // Nav position
+  const pos = document.getElementById('analysisNavPos');
+  if (pos) pos.textContent = `${idx + 1} / ${_analysisHistory.length}`;
+
+  // Boutons prev/next
+  const btnPrev = document.getElementById('btnPrevAnalysis');
+  const btnNext = document.getElementById('btnNextAnalysis');
+  if (btnPrev) btnPrev.disabled = idx >= _analysisHistory.length - 1;
+  if (btnNext) btnNext.disabled = idx <= 0;
+
+  const h = _analysisHistory[idx];
+  const display = document.getElementById('analysisDisplay');
+  if (!display) return;
+
+  display.innerHTML = '<p style="color:var(--text-dim);padding:10px 0">Chargement...</p>';
+
+  fetch(`/api/analyses/${h.id}`).then(r => r.json()).then(a => {
+    const sev = ['critical', 'warning', 'ok'].includes(a.severity) ? a.severity : 'pending';
+    const sevEmoji = sev === 'critical' ? '🔴' : sev === 'warning' ? '🟡' : '🟢';
+    const delta = idx < _analysisHistory.length - 1
+      ? (h.perf_score || 0) - (_analysisHistory[idx + 1].perf_score || 0) : null;
+    const deltaHtml = delta !== null
+      ? `<span class="${delta > 0 ? 'delta-better' : delta < 0 ? 'delta-worse' : 'delta-neutral'}" style="margin-left:8px;font-size:13px">
+          ${delta > 0 ? '▲ +' : delta < 0 ? '▼ ' : '= '}${delta !== 0 ? Math.abs(delta) : ''}
+         </span>` : '';
+
+    display.innerHTML = `
+      <div class="analysis-header-row">
+        <div class="analysis-meta-line">
+          <span class="analysis-date-label">${escapeHTML(utcToLocal(a.analyzed_at))}</span>
+          <span class="model-tag">${escapeHTML(a.model_used || '')}</span>
+          ${a.tokens_in || a.tokens_out ? `<span class="tokens-badge">🪙 ${(a.tokens_in||0)+(a.tokens_out||0)} tokens</span>` : ''}
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          <div class="score-inline score-${(a.perf_score||0)>=80?'ok':(a.perf_score||0)>=50?'warning':'critical'}">
+            ${a.perf_score ?? '?'}<span>/100</span>
+          </div>${deltaHtml}
+        </div>
+      </div>
+      <div class="severity-banner ${sev}" style="margin:12px 0">
+        ${sevEmoji} ${escapeHTML(a.summary || '')}
+      </div>
+      <div class="ai-markdown" id="analysisMarkdownDisplay"></div>
+      <div id="analysisTraceContainer"></div>
+    `;
+
+    if (a.raw_response) {
+      renderMarkdown(a.raw_response, 'analysisMarkdownDisplay');
+    }
+
+    // Trace d'exécution
+    const trace = a.trace || [];
+    const traceContainer = document.getElementById('analysisTraceContainer');
+    if (traceContainer && trace.length > 0) {
+      const hasErrors = trace.some(e => !e.ok);
+      const errBadge = hasErrors ? ` <span style="color:#f87171;font-size:11px">⚠️ ${trace.filter(e=>!e.ok).length} erreur(s)</span>` : '';
+      traceContainer.innerHTML = `
+        <details class="trace-details">
+          <summary>🪵 Log d'exécution (${trace.length} appel(s) d'outils)${errBadge}</summary>
+          <div class="trace-log">
+            ${trace.map(e => {
+              const icon = e.ok ? '✅' : '❌';
+              const argsStr = Object.entries(e.args || {}).map(([k,v]) => `${escapeHTML(k)}=<em>${escapeHTML(String(v).slice(0,40))}</em>`).join(', ');
+              const errMsg = e.error ? `<span class="trace-error">→ ${escapeHTML(e.error)}</span>` : '';
+              return `<div class="trace-entry ${e.ok ? '' : 'trace-entry-err'}">
+                <span class="trace-icon">${icon}</span>
+                <span class="trace-time">${escapeHTML(e.t)}</span>
+                <span class="trace-tool">${escapeHTML(e.tool)}</span>
+                <span class="trace-args">(${argsStr})</span>
+                <span class="trace-ms">${escapeHTML(e.ms)}ms</span>
+                ${errMsg}
+              </div>`;
+            }).join('')}
+          </div>
+        </details>`;
+    }
+  }).catch(err => {
+    display.textContent = 'Erreur chargement : ' + err;
+  });
+}
+
+function navigateAnalysis(dir) {
+  // dir=-1 = plus ancienne, dir=+1 = plus récente
+  showAnalysis(_analysisIdx - dir);
+}
+
+function deleteAnalysis(evt, analysisId) {
+  evt.stopPropagation();
+  if (!confirm('Supprimer cette analyse ? Cette action est irréversible.')) return;
+  fetch(`/api/analyses/${analysisId}`, {method: 'DELETE', credentials: 'same-origin'})
+    .then(r => r.json())
+    .then(res => {
+      if (!res.ok) { alert('Erreur lors de la suppression'); return; }
+      // Retirer l'analyse du tableau local
+      const removed = _analysisHistory.findIndex(h => h.id === analysisId);
+      if (removed === -1) return;
+      _analysisHistory.splice(removed, 1);
+      // Reconstruire les pastilles
+      _rebuildPills();
+      if (_analysisHistory.length === 0) {
+        document.getElementById('analysisDisplay').innerHTML = '<p class="pending-msg">Aucune analyse restante.</p>';
+        document.getElementById('analysisPills').innerHTML = '';
+        return;
+      }
+      // Afficher la plus récente
+      const newIdx = Math.min(_analysisIdx, _analysisHistory.length - 1);
+      showAnalysis(newIdx);
+    })
+    .catch(() => alert('Erreur réseau'));
+}
+
+function _rebuildPills() {
+  const container = document.getElementById('analysisPills');
+  if (!container) return;
+  const IS_ADMIN = document.body.dataset.admin === 'true';
+  container.innerHTML = _analysisHistory.map((h, i) => {
+    const sev = h.severity || 'pending';
+    const delBtn = IS_ADMIN ? `<button class="pill-del" onclick="deleteAnalysis(event, ${h.id})" title="Supprimer">×</button>` : '';
+    return `<div class="analysis-pill dot-${sev}" data-idx="${i}" data-id="${h.id}"
+      onclick="showAnalysis(${i})"
+      title="${(h.analyzed_at||'').slice(0,16)} — ${h.perf_score||'?'}/100">
+      <span class="pill-date">${utcToLocal(h.analyzed_at)}</span>
+      <span class="pill-score">${h.perf_score||'?'}/100</span>
+      ${delBtn}
+    </div>`;
+  }).join('');
+  // Mettre à jour le compteur nav
+  const pos = document.getElementById('analysisNavPos');
+  if (pos) pos.textContent = _analysisHistory.length > 0 ? `${_analysisIdx + 1} / ${_analysisHistory.length}` : '';
+}
+</script>
+<script>
+// Convertit un timestamp SQLite UTC ("YYYY-MM-DD HH:MM:SS") en heure locale courte
+function utcToLocal(utcStr) {
+  if (!utcStr) return '';
+  // SQLite stocke sans 'Z' — on l'ajoute pour que le browser interprète bien en UTC
+  const d = new Date(utcStr.replace(' ', 'T') + 'Z');
+  if (isNaN(d)) return utcStr.slice(0, 16);
+  return d.toLocaleString('fr-FR', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+}
+
+// Convertir tous les éléments [data-utc] au chargement
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[data-utc]').forEach(el => {
+    el.textContent = utcToLocal(el.dataset.utc);
+  });
+  document.querySelectorAll('[data-utc-title]').forEach(el => {
+    const loc = utcToLocal(el.dataset.utcTitle);
+    el.title = loc + el.title.replace(/^[^\u2014]*—/, ' —');
+  });
+});
+</script>
+</body>
+</html>
