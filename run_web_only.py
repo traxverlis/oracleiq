@@ -1,5 +1,5 @@
-from oracleiq import cmd_web
+from oracleiq import main
 
 
 if __name__ == "__main__":
-    cmd_web()
+    raise SystemExit(main(["web"]))

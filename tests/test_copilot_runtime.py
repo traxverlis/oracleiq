@@ -53,14 +53,21 @@ class CopilotRuntimeTests(unittest.TestCase):
         @asynccontextmanager
         async def local_client(token):
             with tempfile.TemporaryDirectory(prefix="odin-sdk-test-") as directory:
+                runtime_env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR")
+                               if key in os.environ}
+                runtime_env.update(
+                    HOME=directory, USERPROFILE=directory, TEMP=directory, TMP=directory,
+                    TMPDIR=directory, APPDATA=directory, LOCALAPPDATA=directory,
+                    COPILOT_OFFLINE="true",
+                )
                 async with CopilotClient(
                     mode="empty", use_logged_in_user=False, working_directory=directory,
-                    base_directory=directory, env={"PATH": os.environ["PATH"], "HOME": directory,
-                                                  "COPILOT_OFFLINE": "true"}, log_level="error",
+                    base_directory=directory, env=runtime_env, log_level="error",
                 ) as client:
                     create = client.create_session
 
                     async def create_local(**options):
+                        self.assertEqual(options.pop("github_token"), "fixture")
                         options["provider"] = {"type": "openai", "base_url": f"http://127.0.0.1:{server.server_port}/v1",
                                                "api_key": "local-fixture", "wire_api": "completions"}
                         return await create(**options)

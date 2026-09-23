@@ -90,8 +90,8 @@ test('captured plan comparison escapes text and handles missing history', async 
   await login(page, 'test-viewer-only');
   await page.goto('/query/1');
   await page.locator('#planComparison summary').click();
-  await expect(page.locator('#planDiff')).toContainText('-TABLE ACCESS FULL ORDERS');
-  await expect(page.locator('#planDiff')).toContainText('+INDEX RANGE SCAN ORDERS_ID');
+  await expect(page.locator('#planDiff')).toContainText('-| 0 | TABLE ACCESS FULL ORDERS |');
+  await expect(page.locator('#planDiff')).toContainText('+| 0 | INDEX RANGE SCAN ORDERS_ID |');
   await expect(page.locator('#planDiff')).toContainText('<img');
   await expect(page.locator('#planDiff img')).toHaveCount(0);
   expect(await page.evaluate(() => window.injected)).toBeUndefined();
@@ -134,7 +134,7 @@ test('administration has a visible heading and navigation', async ({ page }, tes
   await page.locator('.tabs-bar button').nth(1).click();
   await expect(page.locator('#tab-analyse')).toBeVisible();
   await expect(page.locator('#tab-oracle')).toBeHidden();
-  await expect(page.locator('#tab-analyse .setting-row')).toHaveCount(4);
+  await expect(page.locator('#tab-analyse .setting-row')).toHaveCount(5);
   await expect(page.locator('#thinking_budget, #roundsVal, [onclick*="analyzer_ai_mode"]')).toHaveCount(0);
   await expect(page.locator('#ai_model')).toBeVisible();
   await expect(page.locator('#ai_max_tokens')).toBeVisible();

@@ -9,9 +9,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from copilot import CopilotClient
-from copilot.rpc import PermissionDecisionReject
+from copilot.client import ModelInfo
+from copilot.rpc import ModelsListRequest, PermissionDecisionReject
 from copilot.session_events import AssistantUsageData
 from copilot.tools import Tool, ToolResult
+from analyzer.data_policy import (
+    AIPolicyError, MAX_RESPONSE_CHARS, check_budget, prepare_messages, prepare_request, require_copilot,
+)
 
 
 TOKEN_CACHE_PATH = Path.home() / ".oracleiq_copilot_token.json"
@@ -75,16 +79,28 @@ def _github_token(candidate=None):
     return token
 
 
-def _run(operation):
+def _run(operation, timeout=360):
     async def bounded():
         try:
-            async with asyncio.timeout(360):
+            async with asyncio.timeout(timeout):
                 return await operation()
-        except CopilotAuthenticationError:
+        except (CopilotAuthenticationError, AIPolicyError):
             raise
         except TimeoutError:
             raise CopilotAuthenticationError("Delai de reponse du SDK Copilot depasse.") from None
-        except Exception:
+        except Exception as error:
+            detail = str(error)
+            if "Resource not accessible by personal access token" in detail:
+                raise CopilotAuthenticationError(
+                    "GitHub refuse l'acces au compte avec ce jeton (403). "
+                    "Un jeton valide ne suffit pas pour le SDK Copilot : verifiez son proprietaire, "
+                    "la permission Copilot Requests et les restrictions du compte ou de l'organisation."
+                ) from None
+            if "Not authenticated" in detail:
+                raise CopilotAuthenticationError(
+                    "Authentification Copilot refusee. Verifiez le jeton du compte disposant de Copilot "
+                    "et sa permission Copilot Requests. Un jeton enregistre n'est pas forcement authentifie."
+                ) from None
             raise CopilotAuthenticationError(
                 "SDK Copilot indisponible : verifiez le runtime, le jeton, "
                 "la permission Copilot Requests, les politiques du compte et le reseau."
@@ -100,12 +116,29 @@ def _run(operation):
 
 @asynccontextmanager
 async def _client(token):
-    with tempfile.TemporaryDirectory(prefix="odin-copilot-") as directory:
+    with tempfile.TemporaryDirectory(prefix=".odin-copilot-", dir=Path.cwd()) as directory:
         environment = {key: value for key, value in os.environ.items()
-                       if key in {"PATH", "HOME", "LANG", "SYSTEMROOT", "TEMP", "TMP",
+                       if key in {"PATH", "LANG", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
                                   "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy",
                                   "http_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
                                   "COPILOT_CLI_PATH", "COPILOT_CLI_EXTRACT_DIR"}}
+        root = Path(directory)
+        home, scratch = root / "home", root / "scratch"
+        home.mkdir()
+        scratch.mkdir()
+        # Valid runtime paths without inheriting the user's CLI identity/configuration.
+        environment.update(HOME=str(home), TEMP=str(scratch), TMP=str(scratch), TMPDIR=str(scratch))
+        if os.name == "nt":
+            roaming, local = root / "appdata", root / "localappdata"
+            roaming.mkdir()
+            local.mkdir()
+            windows = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or r"C:\Windows"
+            environment.update(
+                USERPROFILE=str(home), HOMEDRIVE=home.drive,
+                HOMEPATH=str(home)[len(home.drive):], APPDATA=str(roaming),
+                LOCALAPPDATA=str(local), SYSTEMROOT=windows,
+                WINDIR=os.environ.get("WINDIR") or windows,
+            )
         async with CopilotClient(
             github_token=token, use_logged_in_user=False, mode="empty",
             working_directory=directory, base_directory=directory,
@@ -114,10 +147,15 @@ async def _client(token):
             yield client
 
 
+async def _list_models(client, token):
+    response = await client.rpc.models.list(ModelsListRequest(git_hub_token=token), timeout=60)
+    return [ModelInfo.from_dict(entry.to_dict()) for entry in response.models]
+
+
 async def _models(token):
     async with _client(token) as client:
         async with asyncio.timeout(60):
-            entries = await client.list_models()
+            entries = await _list_models(client, token)
         models = {}
         for entry in entries:
             if entry.policy and entry.policy.state == "disabled":
@@ -129,11 +167,13 @@ async def _models(token):
 
 
 def list_account_models():
+    require_copilot()
     token = _github_token()
     return _run(lambda: _models(token))
 
 
 def test_github_token(token=None):
+    require_copilot()
     token = _github_token(token)
     models = _run(lambda: _models(token))
     if not models:
@@ -144,7 +184,10 @@ def _deny_permission(request, invocation):
     return PermissionDecisionReject(feedback="Execution reservee aux outils controles par ODIN.")
 
 
-async def _chat(token, messages, tools, model, max_tokens, system, tool_choice, thinking_budget):
+async def _chat(token, messages, tools, model, max_tokens, system, tool_choice, thinking_budget,
+                deadline=None, cancel=None):
+    check_budget(deadline, cancel)
+    messages, system, tools = prepare_request(messages, system, tools)
     calls = []
     usage = {}
     selected_tools = [] if tool_choice == "none" else tools
@@ -182,14 +225,14 @@ async def _chat(token, messages, tools, model, max_tokens, system, tool_choice, 
     async with _client(token) as client:
         options = {}
         if thinking_budget is not None:
-            models = await client.list_models()
+            models = await _list_models(client, token)
             selected = next((entry for entry in models if entry.id == model), None)
             supported = selected.supported_reasoning_efforts if selected else None
             effort = "low" if thinking_budget <= 1024 else "medium" if thinking_budget <= 5000 else "high"
             if supported and effort in supported:
                 options["reasoning_effort"] = effort
         async with await client.create_session(
-            model=model, tools=definitions,
+            model=model, tools=definitions, github_token=token,
             available_tools=[f"custom:{name}" for name in sorted(allowed_names)],
             excluded_tools=["builtin:*", "mcp:*"],
             on_permission_request=_deny_permission, on_event=on_event,
@@ -200,8 +243,12 @@ async def _chat(token, messages, tools, model, max_tokens, system, tool_choice, 
             memory={"enabled": False}, infinite_sessions={"enabled": False},
             **options,
         ) as session:
-            response = await session.send_and_wait(json.dumps(messages, ensure_ascii=False), timeout=300)
+            response = await session.send_and_wait(
+                json.dumps(messages, ensure_ascii=False), timeout=check_budget(deadline, cancel))
+            check_budget(deadline, cancel)
             text = response.data.content if response else ""
+            if len(text or "") > MAX_RESPONSE_CHARS:
+                raise AIPolicyError("Budget reponse IA depasse apres reception.")
     if usage:
         usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
     if not text and not calls:
@@ -210,15 +257,20 @@ async def _chat(token, messages, tools, model, max_tokens, system, tool_choice, 
 
 
 def chat(messages: list, model: str = "claude-sonnet-4.6", max_tokens: int = 2000,
-         system: str = None, _retry: int = 0, thinking_budget_tokens: int = 1024) -> tuple[str, dict]:
+         system: str = None, _retry: int = 0, thinking_budget_tokens: int = 1024,
+         deadline=None, cancel=None) -> tuple[str, dict]:
+    messages, system = prepare_messages(messages, system)
     token = _github_token()
     text, _, usage = _run(lambda: _chat(
-        token, messages, [], model, max_tokens, system, "none", thinking_budget_tokens))
+        token, messages, [], model, max_tokens, system, "none", thinking_budget_tokens,
+        deadline, cancel), timeout=check_budget(deadline, cancel))
     return text, usage
 
 
 def chat_with_tools(messages: list, tools: list, model: str = "claude-sonnet-4.6",
                     max_tokens: int = 4000, system: str = None, tool_choice: str = "auto",
-                    _retry: int = 0) -> tuple[str | None, list, dict]:
+                    _retry: int = 0, deadline=None, cancel=None) -> tuple[str | None, list, dict]:
+    messages, system = prepare_messages(messages, system)
     token = _github_token()
-    return _run(lambda: _chat(token, messages, tools, model, max_tokens, system, tool_choice, None))
+    return _run(lambda: _chat(token, messages, tools, model, max_tokens, system, tool_choice, None,
+                             deadline, cancel), timeout=check_budget(deadline, cancel))

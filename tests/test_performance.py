@@ -41,7 +41,7 @@ class PerformanceTests(unittest.TestCase):
 
 class PerformanceStorageTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
+        temporary = tempfile.TemporaryDirectory(dir=Path.cwd(), prefix=".test-performance-")
         self.addCleanup(temporary.cleanup)
         path_patch = patch.object(store, "DB_PATH", Path(temporary.name) / "performance.db")
         path_patch.start()

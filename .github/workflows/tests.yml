@@ -4,7 +4,13 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +26,8 @@ jobs:
         env:
           ODIN_TEST_COPILOT_RUNTIME: '1'
       - run: python test_odin.py
-      - run: npm ci && npm run vendor
+      - run: npm ci
+      - run: npm run vendor
       - run: npx playwright install --with-deps chromium
       - run: npm test
         env:

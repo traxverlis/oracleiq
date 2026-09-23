@@ -11,8 +11,9 @@
 <script src="/static/js/common.js"></script>
 <script defer src="/static/vendor/lucide.js"></script>
 <script defer src="/static/js/query-performance.js"></script>
+{% if is_admin %}<script defer src="/static/js/query-privacy.js"></script>{% endif %}
 </head>
-<body data-admin="{{ 'true' if is_admin else 'false' }}" data-query-id="{{ query.id }}" class="query-detail">
+<body data-admin="{{ 'true' if is_admin else 'false' }}" data-query-id="{{ query.id }}" data-plan-id="{{ query.plan_id if query.plan_id is defined and query.plan_id is not none else '' }}" class="query-detail">
 <nav class="navbar">
   <div class="nav-brand"><a href="/" style="color:inherit;text-decoration:none">🔮 ODI<span class="nav-title-iq">N</span></a></div>
   <div class="nav-sub">Détail de la requête #{{ query.id }}</div>
@@ -47,6 +48,15 @@
   </div>
 
   <!-- Alertes -->
+  {% if analysis and (analysis.plan_id is not defined or analysis.plan_id is none or analysis.plan_id != query.plan_id) %}
+  <div id="latestAnalysisProvenance" class="notice notice-error" role="status">
+    {% if analysis.plan_id is not defined or analysis.plan_id is none %}
+    Provenance de la dernière analyse non renseignée (ancienne analyse ou absence de capture). Diagnostic à réactualiser avant utilisation.
+    {% else %}
+    Dernière analyse liée à une ancienne capture du plan : diagnostic à réactualiser, non représentatif de la capture actuelle.
+    {% endif %}
+  </div>
+  {% endif %}
   {% if query.analysis_error %}<div class="notice notice-error" role="alert">{{ query.analysis_error }}</div>{% endif %}
   {% if query.plan_change_detected %}
   <div class="alert alert-warning">
@@ -65,6 +75,16 @@
     <h2>📝 Requête SQL</h2>
     <pre class="sql-full">{{ query.sql_text }}</pre>
   </section>
+  {% if is_admin %}
+  <section class="card" aria-labelledby="aiPreviewTitle">
+    <h2 id="aiPreviewTitle">Confidentialité du contexte IA</h2>
+    <p>L’aperçu est construit à partir des données locales, sans appel Oracle ni IA. La transmission utilise uniquement GitHub Copilot. Les résultats des futurs appels d’outils ne sont pas inclus. Le masquage ne garantit pas l’absence de données sensibles : vérifiez aussi les identifiants et le texte libre. Les erreurs Oracle restent expurgées même en mode brut.</p>
+    <button type="button" class="nav-btn" id="loadAiPreview">Aperçu du contexte IA</button>
+    <p id="aiPreviewStatus" role="status" aria-live="polite"></p>
+    <p id="aiPreviewMetadata" class="comparison-status" hidden></p>
+    <pre id="aiPreviewContent" class="plan-text" hidden></pre>
+  </section>
+  {% endif %}
 
   <!-- Métriques -->
   <section class="card">
@@ -143,11 +163,12 @@
     <div class="analysis-pills" id="analysisPills">
       {% for h in history %}
       <div class="analysis-pill dot-{{ h.severity or 'pending' }}" data-idx="{{ loop.index0 }}" data-id="{{ h.id }}"
-           onclick="showAnalysis(Number(this.dataset.idx))" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"
            title="{{ h.analyzed_at[:16] }} — {{ h.perf_score or '?' }}/100" data-utc-title="{{ h.analyzed_at }}">
+        <button type="button" class="pill-select" data-idx="{{ loop.index0 }}" onclick="showAnalysis(Number(this.dataset.idx))" aria-label="Afficher l’analyse du {{ h.analyzed_at }}">
         <span class="pill-date" data-utc="{{ h.analyzed_at }}">{{ h.analyzed_at[5:16] }}</span>
-        <span class="pill-score">{{ h.perf_score or '?' }}/100</span>
-        {% if is_admin %}<button class="pill-del" data-id="{{ h.id }}" onclick="deleteAnalysis(event, Number(this.dataset.id))" title="Supprimer cette analyse">×</button>{% endif %}
+        <span class="pill-score">{{ h.perf_score if h.perf_score is not none else '?' }}/100</span>
+        </button>
+        {% if is_admin %}<button type="button" class="pill-del" data-id="{{ h.id }}" onclick="deleteAnalysis(event, Number(this.dataset.id))" title="Supprimer cette analyse" aria-label="Supprimer l’analyse du {{ h.analyzed_at }}">×</button>{% endif %}
       </div>
       {% endfor %}
     </div>
@@ -225,16 +246,17 @@
   <!-- Chat IA par requête -->
   <section class="card" id="chatSection">
     <h2>💬 Discussion avec l'IA
-      {% if is_admin %}<button class="btn-chat-clear" onclick="clearChat()" title="Effacer la conversation">🗑️</button>{% endif %}
+      {% if is_admin %}<button class="btn-chat-clear" onclick="clearChat()" title="Effacer la conversation" aria-label="Effacer la conversation">🗑️</button>{% endif %}
       <span style="font-size:11px;font-weight:400;color:#e8820c;margin-left:8px">🔧 Mode natif — peut interroger Oracle en direct</span>
     </h2>
     <div class="chat-history" id="chatHistory"></div>
     <div class="chat-input-row">
-      <textarea id="chatInput" class="chat-input" placeholder="Posez une question sur cette requête..." rows="2"
-        onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault(); sendChat();}"></textarea>
+      <textarea id="chatInput" class="chat-input" aria-label="Message à l’IA" placeholder="Posez une question sur cette requête..." rows="2"
+        onkeydown="if(event.key==='Enter' && !event.shiftKey && !event.isComposing){event.preventDefault(); sendChat();}"></textarea>
       <button class="btn-chat-send" id="btnChatSend" onclick="sendChat()">Envoyer ↑</button>
     </div>
     <div class="chat-hint">Entrée pour envoyer · Maj+Entrée pour sauter une ligne</div>
+    <p id="chatStatus" role="status" aria-live="polite"></p>
   </section>
 
 </div>
@@ -352,75 +374,58 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Replay SQL ──────────────────────────────────────────────────────────────
-function replaySQL() {
+async function replaySQL() {
   const btn = document.getElementById('btnReplay');
   const status = document.getElementById('replayStatus');
   const content = document.getElementById('replayContent');
   btn.disabled = true;
   status.textContent = '⏳ Exécution en cours...';
-  content.innerHTML = '<p style="color:var(--text-dim);font-size:12px">⏳ Envoi à Oracle...</p>';
-
-  fetch('/api/queries/' + QUERY_ID + '/replay', {method: 'POST'})
-    .then(r => r.json())
-    .then(d => {
-      btn.disabled = false;
-      if (!d.ok) {
-        status.textContent = '';
-        content.textContent = d.error || d.detail || 'Exécution refusée';
-        return;
-      }
-      status.textContent = '';
-      let html = '';
-
+  content.textContent = '⏳ Envoi à Oracle...';
+  try {
+      const d = await requestJSON('/api/queries/' + QUERY_ID + '/replay', {method: 'POST'});
+      content.replaceChildren();
+      const text = (parent, tag, value) => {
+        const node = document.createElement(tag);
+        node.textContent = String(value ?? '');
+        parent.append(node);
+        return node;
+      };
       if (d.elapsed_ms !== null && d.elapsed_ms !== undefined) {
-        const color = d.elapsed_ms > 1000 ? 'var(--red)' : d.elapsed_ms > 200 ? 'var(--amber)' : 'var(--green)';
-        html += '<div style="margin-bottom:14px">';
-        html += '<span style="font-size:22px;font-weight:700;color:' + color + '">' + d.elapsed_ms + ' ms</span>';
-        html += '<span style="font-size:12px;color:var(--text-dim);margin-left:8px">' + (d.rows_returned ?? 0) + ' ligne(s) retournée(s) — ' + (d.note || '') + '</span>';
-        html += '</div>';
-      } else if (d.exec_error) {
-        html += '<p style="color:var(--red);font-size:12px">⚠️ Exécution : ' + d.exec_error + '</p>';
+        text(content, 'p', `${d.elapsed_ms} ms — ${d.rows_returned ?? 0} ligne(s) retournée(s) — ${d.note || ''}`);
       }
-
+      if (d.exec_error) text(content, 'p', `⚠️ Exécution : ${d.exec_error}`).className = 'error-text';
       if (d.sample_rows && d.sample_rows.length > 0 && d.columns && d.columns.length > 0) {
-        const MAX_COLS = 8;
-        const cols = d.columns.slice(0, MAX_COLS);
-        const truncated = d.columns.length > MAX_COLS;
-        html += '<div style="overflow-x:auto;margin-bottom:14px">';
-        html += '<table style="width:100%;border-collapse:collapse;font-size:11px">';
-        html += '<thead><tr>';
-        cols.forEach(c => { html += '<th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);color:var(--text-dim);font-weight:600">' + c + '</th>'; });
-        if (truncated) html += '<th style="padding:4px 8px;color:var(--text-dim)">…</th>';
-        html += '</tr></thead><tbody>';
+        const wrap = document.createElement('div');
+        wrap.className = 'content-table-wrap';
+        wrap.tabIndex = 0;
+        wrap.setAttribute('role', 'region');
+        wrap.setAttribute('aria-label', 'Résultats du rejeu');
+        const table = document.createElement('table');
+        const header = table.createTHead().insertRow();
+        d.columns.forEach(column => text(header, 'th', column).scope = 'col');
+        const body = table.createTBody();
         d.sample_rows.forEach(row => {
-          html += '<tr>';
-          cols.forEach(c => {
-            const v = row[c];
-            const disp = (v !== null && v !== undefined) ? v : '<em style="color:var(--text-dim)">NULL</em>';
-            html += '<td style="padding:3px 8px;border-bottom:1px solid var(--border);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (v ?? '') + '">' + disp + '</td>';
-          });
-          if (truncated) html += '<td style="padding:3px 8px;color:var(--text-dim)">…</td>';
-          html += '</tr>';
+          const tr = body.insertRow();
+          d.columns.forEach(column => text(tr, 'td', row[column] ?? 'NULL'));
         });
-        html += '</tbody></table></div>';
+        wrap.append(table);
+        content.append(wrap);
       }
-
       if (d.plan_text && !d.plan_text.startsWith('[Plan non disponible')) {
-        html += '<details style="margin-top:4px">';
-        html += '<summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--blue);user-select:none">🗂️ Plan d&#39;exécution (EXPLAIN PLAN)</summary>';
-        html += '<pre style="margin-top:8px;font-size:11px;white-space:pre-wrap;overflow-x:auto">' + d.plan_text + '</pre>';
-        html += '</details>';
+        const details = document.createElement('details');
+        text(details, 'summary', '🗂️ Plan d’exécution (EXPLAIN PLAN)');
+        text(details, 'pre', d.plan_text).className = 'plan-text';
+        content.append(details);
       } else if (d.plan_text) {
-        html += '<p style="color:var(--text-dim);font-size:12px">' + d.plan_text + '</p>';
+        text(content, 'p', d.plan_text);
       }
-
-      content.innerHTML = DOMPurify.sanitize(html || '<p>Requête exécutée avec succès.</p>', { USE_PROFILES: { html: true } });
-    })
-    .catch(e => {
-      btn.disabled = false;
-      status.textContent = '';
-      content.textContent = 'Erreur réseau : ' + e;
-    });
+      if (!content.childNodes.length) text(content, 'p', 'Requête exécutée avec succès.');
+  } catch (error) {
+    content.textContent = 'Échec du rejeu : ' + error.message;
+  } finally {
+    btn.disabled = false;
+    status.textContent = '';
+  }
 }
 
 
@@ -458,6 +463,7 @@ function renderMarkdown(raw, containerId) {
   if (mdBody) {
     marked.setOptions({ gfm: true, breaks: true });
     container.innerHTML = safeMarkdown(mdBody);
+    wrapMarkdownTables(container);
     // Ajouter bouton copier sur chaque bloc de code
     container.querySelectorAll('pre').forEach(pre => {
       const code = pre.querySelector('code');
@@ -466,21 +472,9 @@ function renderMarkdown(raw, containerId) {
       const btn = document.createElement('button');
       btn.className = 'copy-code-btn';
       btn.title = 'Copier';
+      btn.setAttribute('aria-label', 'Copier le code');
       btn.textContent = '📋';
-      btn.onclick = () => {
-        const text = code.innerText;
-        const doFeedback = () => { btn.textContent = '✅'; setTimeout(() => btn.textContent = '📋', 2000); };
-        if (navigator.clipboard && window.isSecureContext) {
-          navigator.clipboard.writeText(text).then(doFeedback);
-        } else {
-          // Fallback HTTP
-          const ta = document.createElement('textarea');
-          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-          document.body.appendChild(ta); ta.focus(); ta.select();
-          try { document.execCommand('copy'); doFeedback(); } catch(e) { btn.textContent = '❌'; }
-          document.body.removeChild(ta);
-        }
-      };
+      btn.onclick = () => copyCodeText(btn, code.textContent);
       pre.appendChild(btn);
     });
   }
@@ -499,19 +493,16 @@ function appendMessage(role, content, animate) {
   div.className = 'chat-msg chat-' + role;
   if (role === 'assistant') {
     div.innerHTML = renderChatMarkdown(content);
+    wrapMarkdownTables(div);
     div.querySelectorAll('pre').forEach(pre => {
       const code = pre.querySelector('code');
       if (!code) return;
       pre.style.position = 'relative';
       const btn = document.createElement('button');
       btn.className = 'copy-code-btn';
+      btn.setAttribute('aria-label', 'Copier le code');
       btn.textContent = '📋';
-      btn.onclick = () => {
-        const text = code.innerText;
-        const ok = () => { btn.textContent = '✅'; setTimeout(()=>btn.textContent='📋',2000); };
-        if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(ok);
-        else { const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.focus(); ta.select(); try{document.execCommand('copy');ok();}catch(e){} document.body.removeChild(ta); }
-      };
+      btn.onclick = () => copyCodeText(btn, code.textContent);
       pre.appendChild(btn);
     });
   } else {
@@ -532,30 +523,42 @@ function loadChatHistory() {
   });
 }
 
-function sendChat() {
+let chatSending = false;
+async function sendChat() {
   const input = document.getElementById('chatInput');
   const btn   = document.getElementById('btnChatSend');
   const msg   = input.value.trim();
-  if (!msg) return;
-  appendMessage('user', msg, true);
-  input.value = '';
+  if (!msg || chatSending) return;
+  chatSending = true;
+  const originalText = input.value;
+  const userMessage = appendMessage('user', msg, true);
+  const status = document.getElementById('chatStatus');
+  status.textContent = 'Envoi en cours…';
+  input.readOnly = true;
   btn.disabled = true;
   btn.textContent = '⏳';
   const thinking = appendMessage('assistant', '_Réflexion en cours..._', true);
   const curAnalysis = _analysisHistory.length > 0 ? _analysisHistory[_analysisIdx] : null;
-  fetch(`/api/queries/${QUERY_ID}/chat`, {
+  try {
+    const data = await requestJSON(`/api/queries/${QUERY_ID}/chat`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({message: msg, analysis_id: curAnalysis ? curAnalysis.id : null})
-  }).then(r => r.json()).then(data => {
+    });
+    if (!data.reply) throw new Error('Réponse IA absente.');
+    appendMessage('assistant', data.reply, true);
+    input.value = '';
+    status.textContent = '';
+  } catch (error) {
+    userMessage.remove();
+    input.value = originalText;
+    status.textContent = `Échec de l’envoi : ${error.message} Votre texte est conservé.`;
+  } finally {
     thinking.remove();
-    appendMessage('assistant', data.reply || 'Erreur', true);
+    chatSending = false;
+    input.readOnly = false;
     btn.disabled = false; btn.textContent = 'Envoyer ↑';
-  }).catch(() => {
-    thinking.remove();
-    appendMessage('assistant', '❌ Erreur de communication avec l\'IA.', true);
-    btn.disabled = false; btn.textContent = 'Envoyer ↑';
-  });
+  }
 }
 
 function clearChat() {
@@ -589,22 +592,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ── Re-analyser ───────────────────────────────────────────────────────────────
 function reanalyze() {
-  const btn = document.getElementById('btnAnalyze');
-  btn.disabled = true;
-  btn.textContent = '\u23f3 Analyse en cours...';
-  btn.classList.add('btn-analyzing');
-  const status = document.getElementById('analyzeStatus');
-  status.style.display = 'block';
-
-  reanalyzeNative();
+  return reanalyzeNative(false);
 }
 
-function reanalyzeNative(resumeOnly) {
+async function reanalyzeNative(resumeOnly = false) {
   const btn = document.getElementById('btnAnalyze');
+  if (!resumeOnly && btn.disabled) return;
   const status = document.getElementById('analyzeStatus');
   const progress = document.getElementById('analyzeProgress');
+  btn.disabled = true;
+  btn.textContent = '⏳ Analyse en cours...';
+  btn.classList.add('btn-analyzing');
+  status.style.display = 'block';
   progress.style.display = 'block';
   progress.innerHTML = '';
+  if (!resumeOnly) {
+    status.textContent = 'Ajout de l’analyse à la file…';
+    try {
+      await requestJSON(`/api/analyze/${QUERY_ID}`, {method: 'POST'});
+    } catch (error) {
+      status.textContent = 'Échec du lancement : ' + error.message;
+      btn.disabled = false;
+      btn.textContent = '🔄 Re-analyser';
+      btn.classList.remove('btn-analyzing');
+      return;
+    }
+  }
   status.textContent = resumeOnly ? '\ud83d\udd04 Reconnexion au stream...' : '\ud83d\udd0c Connexion SSE...';
 
   const addStep = (icon, text, cls) => {
@@ -670,6 +683,8 @@ function pollUntilDone() {
 // ── Navigation entre analyses ─────────────────────────────────────────────
 let _analysisHistory = [];
 let _analysisIdx = 0;
+let analysisVersion = 0;
+let analysisController;
 
 function initAnalysisNav() {
   const dataEl = document.getElementById('analysisHistoryData');
@@ -680,11 +695,15 @@ function initAnalysisNav() {
 
 function showAnalysis(idx) {
   if (idx < 0 || idx >= _analysisHistory.length) return;
+  const version = ++analysisVersion;
+  analysisController?.abort();
+  analysisController = new AbortController();
   _analysisIdx = idx;
 
   // Highlight pastille active
   document.querySelectorAll('.analysis-pill').forEach((el, i) => {
     el.classList.toggle('active', i === idx);
+    el.querySelector('.pill-select')?.setAttribute('aria-pressed', String(i === idx));
   });
 
   // Nav position
@@ -703,7 +722,8 @@ function showAnalysis(idx) {
 
   display.innerHTML = '<p style="color:var(--text-dim);padding:10px 0">Chargement...</p>';
 
-  fetch(`/api/analyses/${h.id}`).then(r => r.json()).then(a => {
+  requestJSON(`/api/analyses/${h.id}`, {signal: analysisController.signal}).then(a => {
+    if (version !== analysisVersion) return;
     const sev = ['critical', 'warning', 'ok'].includes(a.severity) ? a.severity : 'pending';
     const sevEmoji = sev === 'critical' ? '🔴' : sev === 'warning' ? '🟡' : '🟢';
     const delta = idx < _analysisHistory.length - 1
@@ -714,6 +734,7 @@ function showAnalysis(idx) {
          </span>` : '';
 
     display.innerHTML = `
+      <p id="analysisPlanStatus" role="status"></p>
       <div class="analysis-header-row">
         <div class="analysis-meta-line">
           <span class="analysis-date-label">${escapeHTML(utcToLocal(a.analyzed_at))}</span>
@@ -732,6 +753,18 @@ function showAnalysis(idx) {
       <div class="ai-markdown" id="analysisMarkdownDisplay"></div>
       <div id="analysisTraceContainer"></div>
     `;
+    const provenance = document.getElementById('analysisPlanStatus');
+    const currentPlan = document.body.dataset.planId;
+    const analysisPlan = a.plan_id;
+    const current = analysisPlan != null && currentPlan !== '' && String(analysisPlan) === currentPlan;
+    provenance.className = current ? 'comparison-status' : 'notice notice-error';
+    if (analysisPlan == null) {
+      provenance.textContent = 'Provenance de l’analyse non renseignée (ancienne analyse ou absence de capture). Diagnostic à réactualiser avant utilisation.';
+    } else if (!current) {
+      provenance.textContent = `Analyse liée à une ancienne capture #${analysisPlan} (capture actuelle : ${currentPlan || 'indisponible'}). À réactualiser : ce diagnostic ne décrit pas le plan actuel.`;
+    } else {
+      provenance.textContent = `Analyse liée à la capture actuelle #${currentPlan}.`;
+    }
 
     if (a.raw_response) {
       renderMarkdown(a.raw_response, 'analysisMarkdownDisplay');
@@ -764,6 +797,7 @@ function showAnalysis(idx) {
         </details>`;
     }
   }).catch(err => {
+    if (version !== analysisVersion || err.name === 'AbortError') return;
     display.textContent = 'Erreur chargement : ' + err;
   });
 }
@@ -773,13 +807,13 @@ function navigateAnalysis(dir) {
   showAnalysis(_analysisIdx - dir);
 }
 
-function deleteAnalysis(evt, analysisId) {
+async function deleteAnalysis(evt, analysisId) {
   evt.stopPropagation();
   if (!confirm('Supprimer cette analyse ? Cette action est irréversible.')) return;
-  fetch(`/api/analyses/${analysisId}`, {method: 'DELETE', credentials: 'same-origin'})
-    .then(r => r.json())
-    .then(res => {
-      if (!res.ok) { alert('Erreur lors de la suppression'); return; }
+  const button = evt.currentTarget;
+  button.disabled = true;
+  try {
+      await requestJSON(`/api/analyses/${analysisId}`, {method: 'DELETE', credentials: 'same-origin'});
       // Retirer l'analyse du tableau local
       const removed = _analysisHistory.findIndex(h => h.id === analysisId);
       if (removed === -1) return;
@@ -787,32 +821,54 @@ function deleteAnalysis(evt, analysisId) {
       // Reconstruire les pastilles
       _rebuildPills();
       if (_analysisHistory.length === 0) {
+        analysisVersion++;
+        analysisController?.abort();
         document.getElementById('analysisDisplay').innerHTML = '<p class="pending-msg">Aucune analyse restante.</p>';
         document.getElementById('analysisPills').innerHTML = '';
+        document.getElementById('btnPrevAnalysis')?.setAttribute('disabled', '');
+        document.getElementById('btnNextAnalysis')?.setAttribute('disabled', '');
+        document.getElementById('btnAnalyze').focus();
         return;
       }
       // Afficher la plus récente
       const newIdx = Math.min(_analysisIdx, _analysisHistory.length - 1);
       showAnalysis(newIdx);
-    })
-    .catch(() => alert('Erreur réseau'));
+      document.querySelectorAll('.pill-select')[newIdx]?.focus();
+  } catch (error) {
+    alert('Erreur lors de la suppression : ' + error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function _rebuildPills() {
   const container = document.getElementById('analysisPills');
   if (!container) return;
   const IS_ADMIN = document.body.dataset.admin === 'true';
-  container.innerHTML = _analysisHistory.map((h, i) => {
-    const sev = h.severity || 'pending';
-    const delBtn = IS_ADMIN ? `<button class="pill-del" onclick="deleteAnalysis(event, ${h.id})" title="Supprimer">×</button>` : '';
-    return `<div class="analysis-pill dot-${sev}" data-idx="${i}" data-id="${h.id}"
-      onclick="showAnalysis(${i})"
-      title="${(h.analyzed_at||'').slice(0,16)} — ${h.perf_score||'?'}/100">
-      <span class="pill-date">${utcToLocal(h.analyzed_at)}</span>
-      <span class="pill-score">${h.perf_score||'?'}/100</span>
-      ${delBtn}
-    </div>`;
-  }).join('');
+  container.replaceChildren(..._analysisHistory.map((h, i) => {
+    const pill = document.createElement('div');
+    const sev = ['critical', 'warning', 'ok'].includes(h.severity) ? h.severity : 'pending';
+    pill.className = `analysis-pill dot-${sev}`;
+    pill.dataset.id = h.id;
+    pill.dataset.idx = i;
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'pill-select';
+    select.textContent = `${utcToLocal(h.analyzed_at)} — ${h.perf_score ?? '?'}/100`;
+    select.setAttribute('aria-label', `Afficher l’analyse du ${utcToLocal(h.analyzed_at)}`);
+    select.onclick = () => showAnalysis(i);
+    pill.append(select);
+    if (IS_ADMIN) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'pill-del';
+      remove.textContent = '×';
+      remove.setAttribute('aria-label', `Supprimer l’analyse du ${utcToLocal(h.analyzed_at)}`);
+      remove.onclick = event => deleteAnalysis(event, h.id);
+      pill.append(remove);
+    }
+    return pill;
+  }));
   // Mettre à jour le compteur nav
   const pos = document.getElementById('analysisNavPos');
   if (pos) pos.textContent = _analysisHistory.length > 0 ? `${_analysisIdx + 1} / ${_analysisHistory.length}` : '';

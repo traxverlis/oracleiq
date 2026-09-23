@@ -14,8 +14,9 @@ Usage:
   python oracleiq.py all            → Tout en parallèle (collect + analyze + web)
 """
 import sys
-import subprocess
 import os
+import argparse
+import sqlite3
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -23,16 +24,8 @@ BASE = Path(__file__).parent
 
 def load_env():
     """Charge le .env dans os.environ si présent."""
-    env_file = BASE / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip())
-
-
-load_env()
+    from dotenv import load_dotenv
+    load_dotenv(BASE / ".env", override=False, encoding="utf-8-sig", interpolate=False)
 
 
 def cmd_collect():
@@ -92,23 +85,56 @@ def cmd_all():
                 process.join()
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args:
-        print(__doc__)
-        sys.exit(0)
+def _port(value):
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("Le port doit etre compris entre 1 et 65535.")
+    return port
 
-    cmd = args[0]
-    if cmd == "collect":
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="ODIN - surveillance Oracle et analyse Copilot")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("collect", help="Collecteur Oracle")
+    analyze = commands.add_parser("analyze", help="Analyseur Copilot")
+    analyze.add_argument("--once", action="store_true")
+    web = commands.add_parser("web", help="Interface web")
+    web.add_argument("port", nargs="?", type=_port)
+    commands.add_parser("all", help="Collecteur, analyseur et web supervises")
+    backup = commands.add_parser("backup", help="Sauvegarde SQLite coherente, sans ecrasement")
+    backup.add_argument("destination", type=Path)
+    restore = commands.add_parser("restore", help="Restaurer dans un NOUVEAU fichier SQLite")
+    restore.add_argument("source", type=Path)
+    restore.add_argument("destination", type=Path)
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    load_env()
+    if args.command == "collect":
         cmd_collect()
-    elif cmd == "analyze":
-        cmd_analyze(once="--once" in args)
-    elif cmd == "web":
-        port = int(args[1]) if len(args) > 1 else int(os.getenv("WEB_PORT", "8080"))
-        cmd_web(port=port)
-    elif cmd == "all":
+    elif args.command == "analyze":
+        cmd_analyze(once=args.once)
+    elif args.command == "web":
+        cmd_web(port=args.port)
+    elif args.command == "all":
         cmd_all()
-    else:
-        print(f"Commande inconnue : {cmd}")
-        print(__doc__)
-        sys.exit(1)
+    elif args.command in ("backup", "restore"):
+        from scripts.sqlite_backup import copy_database
+        source = args.source if args.command == "restore" else Path(
+            os.getenv("ODIN_DB_PATH", str(BASE / "oracleiq.db"))
+        )
+        try:
+            copy_database(source, args.destination)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            parser.exit(1, f"Erreur : {error}\n")
+        print(f"Copie SQLite verifiee : {args.destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

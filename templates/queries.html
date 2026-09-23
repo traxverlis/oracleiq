@@ -9,6 +9,7 @@
   <script defer src="/static/vendor/lucide.js"></script>
   <script defer src="/static/js/common.js"></script>
   <script defer src="/static/js/dashboard.js"></script>
+  <script defer src="/static/js/alerts.js"></script>
 </head>
 <body data-admin="{{ 'true' if is_admin else 'false' }}">
   <a class="skip-link" href="#main">Aller aux requêtes</a>
@@ -38,6 +39,21 @@
       <div class="stat-card"><span class="stat-num" id="avgScoreVal">{{ stats.avg_score if stats.avg_score is not none else '—' }}</span><span class="stat-label">Score moyen / 100</span></div>
     </div>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <section class="alerts-panel" aria-labelledby="alertsTitle">
+      <div class="performance-controls">
+        <h2 id="alertsTitle">Alertes <span id="alertsCount"></span></h2>
+        <button type="button" class="nav-btn" id="alertsHistory" aria-pressed="false">Historique des alertes</button>
+        <button type="button" class="nav-btn" id="refreshAlerts">Actualiser les alertes</button>
+      </div>
+      <p class="comparison-status">Une régression signalée est une suspicion fondée sur les mesures disponibles, pas une preuve de causalité. Acquitter signifie « vu », pas « résolu ».</p>
+      <p id="alertsStatus" role="status" aria-live="polite"></p>
+      <ul id="alertsList" class="alerts-list"></ul>
+      <nav class="page-controls" aria-label="Pagination des alertes">
+        <button type="button" class="nav-btn" id="alertsPrevious" disabled>Alertes précédentes</button>
+        <span id="alertsPage"></span>
+        <button type="button" class="nav-btn" id="alertsNext" disabled>Alertes suivantes</button>
+      </nav>
+    </section>
     <form class="toolbar" id="filters" role="search">
       <div class="toolbar-group toolbar-search">
         <div class="search-wrap"><i class="search-icon" data-lucide="search" aria-hidden="true"></i><input id="searchInput" type="search" aria-label="Rechercher dans le SQL complet, schéma, module ou SQL ID" placeholder="SQL, schéma, module, SQL ID…" maxlength="500"></div>

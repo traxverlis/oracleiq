@@ -5,21 +5,30 @@ stocke les recommandations.
 """
 import sys
 import json
+import logging
 import time
 import re
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
-from config import AI_PROVIDER, AI_API_KEY, AI_MODEL, AI_BASE_URL, AI_MAX_TOKENS
+from config import AI_PROVIDER, AI_MODEL, AI_MAX_TOKENS
 from db.store import get_unanalyzed, save_analysis
 from collector.connection import connect_oracle
 from analyzer.copilot_client import chat as copilot_chat
+from analyzer.data_policy import (
+    AIPolicyError, LIMITS, WARNINGS, MAX_SQL_CHARS, MAX_PLAN_CHARS, MAX_INPUT_CHARS,
+    MAX_TOOL_RESULT_CHARS, MAX_RESPONSE_CHARS, MAX_TOOL_CALLS, MAX_TURNS, ANALYSIS_TIMEOUT_SECONDS,
+    check_budget, prepare_messages, prepare_request, raw_values_enabled, require_copilot, sanitize_data,
+    tool_payload,
+)
 
 # ─────────────────────────────────────────────
 # Prompt système
 # ─────────────────────────────────────────────
 from analyzer.oracle_tools import TOOLS_DESCRIPTION
+
+_log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """Tu es un expert Oracle Database 19c spécialisé en optimisation de performances SQL.
 Tu analyses des requêtes SQL et leurs plans d'exécution pour identifier les problèmes et proposer des corrections concrètes.
@@ -57,17 +66,25 @@ Types de problèmes : FULL_TABLE_SCAN, MISSING_INDEX, BAD_JOIN_ORDER, CARTESIAN_
 
 USER_TEMPLATE = """Analyse cette requête Oracle 19c :
 
+=== IDENTIFICATION ===
+- SQL_ID : {sql_id}
+- Child number : {child_number}
+- PLAN_HASH_VALUE : {plan_hash_value}
+- Schéma de parsing : {schema}
+- Module : {module}
+- Changement de plan détecté : {plan_change}
+
 === REQUÊTE SQL ===
 {sql}
 
 === STATISTIQUES D'EXÉCUTION ===
 - Exécutions : {executions}
 - Temps moyen : {elapsed_ms_avg} ms
+- CPU moyen : {cpu_ms_avg} ms
 - Pic de moyenne observe : {elapsed_ms_max} ms (pas un maximum par execution)
 - Buffer gets moy : {buffer_gets_avg}
 - Disk reads moy : {disk_reads_avg}
 - Lignes retournées moy : {rows_avg}
-- Schéma : {schema}
 
 === PLAN D'EXÉCUTION ===
 {plan}
@@ -77,13 +94,15 @@ USER_TEMPLATE = """Analyse cette requête Oracle 19c :
 # ─────────────────────────────────────────────
 # Clients IA
 # ─────────────────────────────────────────────
+class _TemplateValues(dict):
+    def __missing__(self, key):
+        return "inconnu"
+
+
 def call_copilot(sql_text: str, context: dict) -> dict:
     """Appel via GitHub Copilot (Claude Sonnet/Opus/Haiku)."""
-    prompt = USER_TEMPLATE.format(
-        sql=sql_text,
-        plan=context.get("plan_text") or "Non disponible",
-        **context
-    )
+    prompt = USER_TEMPLATE.format_map(_TemplateValues(
+        context, sql=sql_text, plan=context.get("plan_text") or "Non disponible"))
     raw, usage = copilot_chat(
         messages=[{"role": "user", "content": prompt}],
         model=AI_MODEL,
@@ -94,45 +113,11 @@ def call_copilot(sql_text: str, context: dict) -> dict:
 
 
 def call_openai(sql_text: str, context: dict) -> dict:
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=AI_API_KEY,
-        base_url=AI_BASE_URL if AI_BASE_URL else None
-    )
-    prompt = USER_TEMPLATE.format(
-        sql=sql_text,
-        plan=context.get("plan_text") or "Non disponible",
-        **context
-    )
-    resp = client.chat.completions.create(
-        model=AI_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=_get_max_tokens(),
-    )
-    raw = resp.choices[0].message.content
-    return {"raw": raw, "model": AI_MODEL}
+    raise AIPolicyError("Fournisseur non pris en charge : ODIN accepte uniquement github-copilot.")
 
 
 def call_anthropic(sql_text: str, context: dict) -> dict:
-    import anthropic
-    client = anthropic.Anthropic(api_key=AI_API_KEY)
-    prompt = USER_TEMPLATE.format(
-        sql=sql_text,
-        plan=context.get("plan_text") or "Non disponible",
-        **context
-    )
-    resp = client.messages.create(
-        model=AI_MODEL,
-        max_tokens=_get_max_tokens(),
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = resp.content[0].text
-    return {"raw": raw, "model": AI_MODEL}
+    raise AIPolicyError("Fournisseur non pris en charge : ODIN accepte uniquement github-copilot.")
 
 
 class AnalysisResult(BaseModel):
@@ -144,7 +129,10 @@ class AnalysisResult(BaseModel):
 
 
 def validate_analysis(data):
-    result = AnalysisResult.model_validate(data)
+    try:
+        result = AnalysisResult.model_validate(data)
+    except ValidationError:
+        raise ValueError("Format d'analyse IA invalide.") from None
     if not result.summary.strip():
         raise ValueError("Resume IA vide")
     return result.model_dump()
@@ -171,15 +159,18 @@ def parse_ai_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Format texte structuré : SCORE: XX / SEVERITY: xxx / SUMMARY: ...
-    score_m = re.search(r'^SCORE:[ \t]*(\d+)[ \t]*$', raw, re.IGNORECASE | re.MULTILINE)
-    sev_m = re.search(r'^SEVERITY:[ \t]*(ok|warning|critical)[ \t]*$', raw, re.IGNORECASE | re.MULTILINE)
-    sum_m = re.search(r'^SUMMARY:[ \t]*([^\n]+)', raw, re.IGNORECASE | re.MULTILINE)
-    if not all((score_m, sev_m, sum_m)):
-        raise ValueError("Reponse IA incomplete : SCORE, SEVERITY et SUMMARY requis")
+    # Format texte structuré : SCORE: XX / SEVERITY: xxx / SUMMARY: ... (décorations Markdown tolérées)
+    prefix = r'(?:^|[/|;][ \t]*)[ \t>#*_-]*'
+    sep = r'[*_ \t]*:[*_ \t]*'
+    score_m = re.search(prefix + r'SCORE' + sep + r'(\d{1,3})(?![\d.,])', raw, re.IGNORECASE | re.MULTILINE)
+    sev_m = re.search(prefix + r'SEVERITY' + sep + r'(ok|warning|critical)\b', raw, re.IGNORECASE | re.MULTILINE)
+    sum_m = re.search(prefix + r'SUMMARY' + sep + r'([^\n]+)', raw, re.IGNORECASE | re.MULTILINE)
+    if not (score_m and sum_m):
+        raise ValueError("Reponse IA incomplete : SCORE et SUMMARY requis")
     score = int(score_m.group(1))
-    severity = sev_m.group(1).lower()
-    summary = sum_m.group(1).strip()[:300]
+    # Models sometimes localize the label ("MOYENNE"); the documented score bands are authoritative.
+    severity = sev_m.group(1).lower() if sev_m else ("ok" if score >= 80 else "warning" if score >= 50 else "critical")
+    summary = sum_m.group(1).strip().strip("*_").strip()[:300]
 
     # Extraire problèmes
     issues = []
@@ -208,22 +199,36 @@ def parse_ai_response(raw: str) -> dict:
 
 def _build_initial_prompt(row: dict) -> str:
     from db.store import get_setting
+    from collector.connection import is_execution_plan_available
     plan_text = row.get("plan_text", "") or ""
-    plan_limit = int(get_setting("plan_truncate", "3000"))
+    plan_available = is_execution_plan_available(plan_text)
+    if len(row.get("sql_text") or "") > MAX_SQL_CHARS:
+        raise AIPolicyError("Budget SQL IA depasse ; aucune transmission effectuee.")
+    try:
+        plan_limit = max(100, min(int(get_setting("plan_truncate", str(MAX_PLAN_CHARS))), MAX_PLAN_CHARS))
+    except (ValueError, TypeError):
+        plan_limit = MAX_PLAN_CHARS
     if len(plan_text) > plan_limit:
         plan_text = plan_text[:plan_limit] + "\n[plan tronqué...]"
     sql_id = row.get("sql_id", "")
-    if not plan_text or "non disponible" in plan_text.lower() or "plan non disponible" in plan_text.lower():
+    if not plan_available:
         plan_section = f"""Non disponible.
-⚠️ Aucun plan d'exécution en base. Tu DOIS appeler `explain_plan({sql_id})` comme première action
-pour générer un plan via EXPLAIN PLAN FOR. Cette opération est sécurisée (pas d'exécution réelle)."""
+⚠️ Aucun plan d'exécution valide en base. Un EXPLAIN PLAN est seulement estime.
+Utilise explain_plan avec sql_id={sql_id} et child_number={row.get('child_number', 'inconnu')} si autorise.
+Il necessite les privileges de parsing et une PLAN_TABLE ; il ne mesure pas une execution."""
     else:
         plan_section = plan_text
     return USER_TEMPLATE.format(
         sql=row["sql_text"],
         plan=plan_section,
+        sql_id=sql_id or "inconnu",
+        child_number=row.get("child_number", "inconnu"),
+        plan_hash_value=row.get("plan_hash_value") or "inconnu",
+        module=row.get("module") or "inconnu",
+        plan_change="oui" if row.get("plan_change_detected") else "non",
         executions=row.get("executions", 1),
         elapsed_ms_avg=row.get("elapsed_ms_avg", 0),
+        cpu_ms_avg=row.get("cpu_ms_avg", 0),
         elapsed_ms_max=row.get("elapsed_ms_max", 0),
         buffer_gets_avg=row.get("buffer_gets_avg", 0),
         disk_reads_avg=row.get("disk_reads_avg", 0),
@@ -232,175 +237,152 @@ pour générer un plan via EXPLAIN PLAN FOR. Cette opération est sécurisée (p
     )
 
 
-def analyze_query(row: dict, oracle_conn=None) -> dict:
+def build_ai_preview(row: dict) -> dict:
+    """Initial masked user/system/tool-schema payload, never future tool results."""
+    from db.store import get_setting
+    from analyzer.oracle_tools import SYSTEM_NATIVE_ANALYZE, get_tools_schema_filtered
+    require_copilot()
+    raw = raw_values_enabled()
+    custom_system = get_setting("system_prompt", "")
+    system = custom_system.strip() if custom_system and custom_system.strip() else SYSTEM_NATIVE_ANALYZE
+    messages, system, tools = prepare_request(
+        [{"role": "user", "content": _build_initial_prompt(row)}],
+        system, get_tools_schema_filtered(), raw=raw)
+    context = {"system": system, "prompt": messages[0]["content"], "tools": tools}
+    return {"provider": "github-copilot", "model": get_setting("ai_model", AI_MODEL),
+            "send_raw_values": raw, "masking_applied": not raw,
+            "ai_send_raw_values": raw, "context": context,
+            "prompt": messages[0]["content"], "system": system, "system_prompt": system, "tools": tools,
+            "limits": dict(LIMITS), "warnings": list(WARNINGS) + [
+                "Apercu initial seulement : les resultats futurs des outils ne sont pas inclus. "
+                "Le SDK ajoute des instructions de transport et un objectif indicatif de tokens."]}
+
+
+def analyze_query(row: dict, oracle_conn=None, **kwargs) -> dict:
     """Analyse une requête avec les outils natifs, quel que soit l'ancien réglage."""
-    return analyze_query_native(row, oracle_conn=oracle_conn)
+    return analyze_query_native(row, oracle_conn=oracle_conn, **kwargs)
 
 
 def _get_max_tokens() -> int:
     """Lit ai_max_tokens depuis les settings DB (dynamique) avec fallback sur config.py."""
     from db.store import get_setting
     try:
-        return int(get_setting("ai_max_tokens", str(AI_MAX_TOKENS)))
+        return max(1, min(int(get_setting("ai_max_tokens", str(AI_MAX_TOKENS))), 32000))
     except (ValueError, TypeError):
         return AI_MAX_TOKENS
 
 
-def analyze_query_native(row: dict, oracle_conn=None) -> dict:
-    """
-    Analyse avec outils natifs via le SDK Copilot, limitée à 30 appels Oracle.
+def analyze_query_native(row: dict, oracle_conn=None, on_event=None, cancel=None) -> dict:
+    """Shared bounded orchestration for automatic, HTTP and SSE analysis.
+
+    Events are dictionaries: thinking(text), tool_start(tool,args),
+    tool_result(tool,result,ok,ms), complete(result). Callback data is masked by
+    default; cancellation is checked between every turn/tool and after SDK calls.
     """
     from analyzer.copilot_client import chat_with_tools
-    from analyzer.oracle_tools import execute_tool_native, get_tools_schema_filtered, SYSTEM_NATIVE_ANALYZE
-    import json
-    import logging
-
-    log = logging.getLogger("oracleiq")
+    from analyzer.oracle_tools import execute_tool_native
+    require_copilot()
+    if oracle_conn is not None:
+        from collector.connection import assert_query_source
+        assert_query_source(row, oracle_conn)
+    deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
     total_usage: dict = {}
     all_parts: list[str] = []
-
-    # Prompt système : custom si configuré, sinon natif par défaut
-    from db.store import get_setting
-    model_used = get_setting("ai_model", AI_MODEL)
-    custom_prompt = get_setting("system_prompt", "")
-    system_native = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else SYSTEM_NATIVE_ANALYZE
-
-    # Outils filtrés selon les settings
-    tools_schema = get_tools_schema_filtered()
-
-    messages: list[dict] = [{"role": "user", "content": _build_initial_prompt(row)}]
-    trace: list[dict] = []  # log des événements pour débogage
-
-    # Sécurité : max 30 appels d'outils au total pour éviter les boucles infinies
-    MAX_TOOL_CALLS = 30
+    preview = build_ai_preview(row)
+    model_used = preview["model"]
+    system_native = preview["system"]
+    tools_schema = preview["tools"]
+    messages = [{"role": "user", "content": preview["prompt"]}]
+    trace = []
     tool_calls_count = 0
+    force_final = False
 
-    while True:
+    def emit(event):
+        if on_event:
+            on_event(sanitize_data(event, raw=raw_values_enabled()))
+
+    for turn in range(MAX_TURNS):
+        check_budget(deadline, cancel)
+        messages, safe_system = prepare_messages(messages, system_native)
         text, tool_calls, usage = chat_with_tools(
-            messages=messages,
-            tools=tools_schema,
-            model=model_used,
-            max_tokens=_get_max_tokens(),
-            system=system_native,
+            messages=messages, tools=[] if force_final else tools_schema, model=model_used,
+            max_tokens=_get_max_tokens(), system=safe_system,
+            tool_choice="none" if force_final else "auto", deadline=deadline, cancel=cancel,
         )
+        check_budget(deadline, cancel)
         for k, v in (usage or {}).items():
             if isinstance(v, (int, float)):
                 total_usage[k] = total_usage.get(k, 0) + v
-
         if text:
+            if len(text) > MAX_RESPONSE_CHARS:
+                raise AIPolicyError("Budget reponse IA depasse.")
             all_parts.append(text)
-
-        # Plus d'appels d'outils ou limite atteinte → l'IA a conclu
+            emit({"type": "thinking", "text": text})
         if not tool_calls:
-            has_score = text and ("SCORE:" in text or "score:" in text.lower())
-            if not has_score and len(all_parts) <= 3:
-                # Texte préliminaire sans tool_calls ni analyse — forcer tool_choice=required
-                log.warning(f"native: réponse préliminaire sans tools ni SCORE, forcçage tool_choice=required")
+            try:
+                parsed = parse_ai_response(text or "")
+            except (ValueError, ValidationError):
+                header = [line.strip()[:120] for line in (text or "").splitlines() if line.strip()][:3]
+                _log.warning("Reponse IA non conforme (%d caracteres, final=%s) ; debut : %r",
+                             len(text or ""), force_final, header)
+                if force_final:
+                    raise ValueError("Reponse IA finale invalide.") from None
                 messages.append({"role": "assistant", "content": text or ""})
-                messages.append({"role": "user", "content": "Tu dois appeler au moins un outil Oracle pour collecter les informations nécessaires avant de rédiger l'analyse."})
-                text, tool_calls, usage2 = chat_with_tools(
-                    messages=messages, tools=tools_schema,
-                    model=model_used, max_tokens=_get_max_tokens(), system=system_native,
-                    tool_choice="required",
-                )
-                for k, v in (usage2 or {}).items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
-                if text:
-                    all_parts.append(text)
-                if not tool_calls:
-                    # Toujours rien — conclusion forcée sur le SQL brut
-                    messages.append({"role": "assistant", "content": text or ""})
-                    messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale avec SCORE: / SEVERITY: / SUMMARY: basée sur le SQL et le plan fournis."})
-                    text3, _, usage3 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=_get_max_tokens(), system=system_native)
-                    if text3:
-                        all_parts.append(text3)
-                    for k, v in (usage3 or {}).items():
-                        if isinstance(v, (int, float)):
-                            total_usage[k] = total_usage.get(k, 0) + v
-                    break
-                # tool_calls dispo — continuer la boucle normale
-            else:
-                break
-
-        if tool_calls_count + len(tool_calls) > MAX_TOOL_CALLS:
-            log.warning(f"native: limite de {MAX_TOOL_CALLS} appels d'outils atteinte, forçage de la conclusion")
-            # Ajouter réponse partielle et forcer conclusion
-            if tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": text,
-                    "tool_calls": [
-                        {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])}}
-                        for tc in tool_calls
-                    ]
-                })
-                for tc in tool_calls:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps({"error": "Limite d'appels atteinte."})
-                    })
-            messages.append({"role": "user", "content": "Tu as collecté suffisamment d'informations. Rédige MAINTENANT l'analyse finale complète avec SCORE: / SEVERITY: / SUMMARY:"})
-            text2, _, usage2 = chat_with_tools(
-                messages=messages, tools=[], model=model_used, max_tokens=_get_max_tokens(), system=system_native
-            )
-            if text2:
-                all_parts.append(text2)
-            for k, v in (usage2 or {}).items():
-                if isinstance(v, (int, float)):
-                    total_usage[k] = total_usage.get(k, 0) + v
+                messages.append({"role": "user", "content":
+                                 "Redige l'analyse finale en commencant exactement par ces trois lignes :\n"
+                                 "SCORE: <entier 0-100>\nSEVERITY: <ok|warning|critical, en anglais>\n"
+                                 "SUMMARY: <une ligne>\n"
+                                 "Indique explicitement les limites des donnees disponibles."})
+                force_final = True
+                continue
             break
-
-        # Ajouter la réponse de l'IA avec les tool_calls
-        assistant_msg: dict = {
-            "role": "assistant",
-            "content": text,
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    }
-                }
-                for tc in tool_calls
-            ]
-        }
-        messages.append(assistant_msg)
-
-        # Exécuter chaque outil et ajouter le résultat
+        if force_final:
+            raise AIPolicyError("Appel outil inattendu pendant la conclusion.")
+        if tool_calls_count + len(tool_calls) > MAX_TOOL_CALLS:
+            raise AIPolicyError("Budget appels outils IA depasse.")
+        messages.append({"role": "assistant", "content": text, "tool_calls": [
+            {"id": tc["id"], "type": "function",
+             "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])}}
+            for tc in tool_calls]})
         for tc in tool_calls:
+            check_budget(deadline, cancel)
             tool_calls_count += 1
-            import time as _time
-            t0 = _time.monotonic()
+            t0 = time.monotonic()
+            emit({"type": "tool_start", "tool": tc["name"], "args": tc["arguments"]})
             if oracle_conn:
-                result = execute_tool_native(oracle_conn, tc["name"], tc["arguments"])
+                kwargs = dict(tc["arguments"])
+                if tc["name"] in {"explain_plan", "bind_captures"} and kwargs.get("sql_id") == row.get("sql_id"):
+                    kwargs["child_number"] = row.get("child_number")
+                result = execute_tool_native(oracle_conn, tc["name"], kwargs,
+                                             deadline=deadline, cancel=cancel)
             else:
                 result = {"error": "Connexion Oracle non disponible pour cet outil."}
-            elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            check_budget(deadline, cancel)
+            result = sanitize_data(result, raw=raw_values_enabled())
+            payload = tool_payload(result)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
             has_error = "error" in result
-            log.info(f"native tool: {tc['name']}({tc['arguments']}) → {str(result)[:80]}")
-            trace.append({
-                "t": _time.strftime("%H:%M:%S"),
-                "tool": tc["name"],
-                "args": tc["arguments"],
-                "ok": not has_error,
-                "error": result.get("error") if has_error else None,
-                "ms": elapsed_ms,
-                "rows": len(result) if isinstance(result, list) else (len(result.get("rows", [])) if isinstance(result, dict) and "rows" in result else None),
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": json.dumps(result, default=str, ensure_ascii=True),
-            })
-
-    final_raw = all_parts[-1] if all_parts else ""
-    full_raw = "\n\n---\n\n".join(all_parts)
-    parsed = parse_ai_response(final_raw)
-    return {
+            event = {"type": "tool_result", "tool": tc["name"], "args": tc["arguments"],
+                     "result": result, "ok": not has_error, "ms": elapsed_ms}
+            emit(event)
+            trace.append(sanitize_data({
+                "t": time.strftime("%H:%M:%S"), "tool": tc["name"], "args": tc["arguments"],
+                "ok": not has_error, "error": "Outil indisponible" if has_error else None,
+                "ms": elapsed_ms}, raw=raw_values_enabled()))
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": payload})
+        if tool_calls_count == MAX_TOOL_CALLS:
+            force_final = True
+            messages.append({"role": "user", "content": "Limite outils atteinte. Conclus en indiquant cette limite."})
+        else:
+            used = len(json.dumps(messages, default=str, ensure_ascii=False)) * 100 // MAX_INPUT_CHARS
+            messages.append({"role": "user", "content": (
+                f"Budget ODIN restant : {MAX_TOOL_CALLS - tool_calls_count} appels d'outils, "
+                f"environ {int(deadline - time.monotonic())} s, contexte utilise {used} %. "
+                + ("Contexte presque plein : conclus maintenant." if used >= 75 else
+                   "Appelle en un seul tour les outils encore necessaires, puis conclus."))})
+    else:
+        raise AIPolicyError("Budget tours IA depasse.")
+    result = {
         "model": model_used,
         "score": parsed.get("score", 50),
         "severity": parsed.get("severity", "warning"),
@@ -408,9 +390,11 @@ def analyze_query_native(row: dict, oracle_conn=None) -> dict:
         "issues": parsed.get("issues", []),
         "trace": trace,
         "recommendations": parsed.get("recommendations", []),
-        "raw": full_raw,
+        "raw": "\n\n---\n\n".join(all_parts),
         "usage": total_usage,
     }
+    emit({"type": "complete", "result": result})
+    return result
 
 
 def run_analyzer(once: bool = False, batch_size: int = 10):
@@ -429,6 +413,7 @@ def run_analyzer(once: bool = False, batch_size: int = 10):
 
 
 def _run_analyzer(once: bool = False, batch_size: int = 10):
+    require_copilot()
     from rich.console import Console
     from rich.progress import track
     console = Console()
@@ -460,7 +445,6 @@ def _run_analyzer(once: bool = False, batch_size: int = 10):
         console.print(f"[cyan]{len(pending)} requête(s) à analyser...[/cyan]")
 
         for row in pending:
-            short_sql = row["sql_text"][:80].replace("\n", " ")
             # Double vérification : ne pas relancer si déjà en queue ou déjà analysé
             from db.store import analyzing_queue_add, analyzing_queue_remove, get_conn as _gc2
             _chk = _gc2()
@@ -470,32 +454,33 @@ def _run_analyzer(once: bool = False, batch_size: int = 10):
             if already_queued or already_analyzed:
                 console.print(f"  [dim]Skip #{row['id']} (déjà en cours ou analysé)[/dim]")
                 continue
-            console.print(f"  → [dim]{short_sql}...[/dim]")
+            console.print(f"  → [dim]Requete #{row['id']}[/dim]")
+            oracle_conn = None
+            claimed = False
             try:
                 if not analyzing_queue_add(row["id"]):
                     continue
+                claimed = True
                 report_service("analyzer", "analyzing", ttl=1800)
-                # Connexion Oracle pour les tools IA
-                oracle_conn = None
-                try:
-                    import oracledb
-                    from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-                    from db.store import get_setting as _gs
-                    _dsn  = _gs("oracle_dsn",  ORACLE_DSN)
-                    _user = _gs("oracle_user", ORACLE_USER)
-                    _pwd  = _gs("oracle_password", ORACLE_PASSWORD)
-                    oracle_conn = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-                except Exception as oe:
-                    console.print(f"    [yellow]Oracle non disponible pour tools: {oe}[/yellow]")
-                try:
-                    analysis = analyze_query(row, oracle_conn=oracle_conn)
-                    save_analysis(row["id"], analysis)
-                    report_service("analyzer", "waiting", success=True)
-                finally:
-                    analyzing_queue_remove(row["id"])
-                    if oracle_conn:
-                        try: oracle_conn.close()
-                        except: pass
+                from db.store import get_query_detail
+                from collector.connection import get_oracle_settings, assert_query_source
+                detail = get_query_detail(row["id"])
+                if not detail.get("query"):
+                    raise ValueError("Requete disparue avant analyse.")
+                row = dict(detail["query"])
+                row["plan_text"] = (detail.get("plan") or {}).get("plan_text")
+                settings = get_oracle_settings()
+                oracle_conn = connect_oracle(user=settings["oracle_user"],
+                                             password=settings["oracle_password"],
+                                             dsn=settings["oracle_dsn"])
+                assert_query_source(row, oracle_conn)
+                analysis = analyze_query(row, oracle_conn=oracle_conn)
+                current = save_analysis(row["id"], analysis, expected_plan_id=row.get("plan_id"))
+                if current is False:
+                    report_service("analyzer", "waiting")
+                    console.print("    [yellow]Analyse archivee mais devenue obsolete ; reanalyse necessaire.[/yellow]")
+                    continue
+                report_service("analyzer", "waiting", success=True)
 
                 color = {"ok": "green", "warning": "yellow", "critical": "red"}.get(
                     analysis["severity"], "white"
@@ -505,11 +490,25 @@ def _run_analyzer(once: bool = False, batch_size: int = 10):
                     f"| {analysis['severity'].upper()}[/{color}] "
                     f"— {analysis['summary'][:100]}"
                 )
-            except Exception as e:
-                report_service("analyzer", "error")
+            except Exception:
                 from db.store import save_analysis_error
-                save_analysis_error(row["id"], "Analyse echouee. Consultez les journaux puis relancez.")
-                console.print(f"    [red]Erreur analyse: {e}[/red]")
+                current_error = save_analysis_error(
+                    row["id"], "Analyse echouee. Consultez les journaux puis relancez.",
+                    expected_plan_id=row.get("plan_id"))
+                if current_error is False:
+                    report_service("analyzer", "waiting")
+                    console.print("    [yellow]Erreur d'analyse obsolete ignoree ; reanalyse necessaire.[/yellow]")
+                else:
+                    report_service("analyzer", "error")
+                    console.print("    [red]Analyse echouee ; details sensibles non affiches.[/red]")
+            finally:
+                if claimed:
+                    analyzing_queue_remove(row["id"])
+                if oracle_conn:
+                    try:
+                        oracle_conn.close()
+                    except Exception:
+                        pass
 
             time.sleep(0.5)  # Rate limit
 

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -16,7 +17,12 @@ from analyzer import copilot_client
 copilot_client.TOKEN_CACHE_PATH = Path(temporary.name) / "copilot_token.json"
 
 from api.app import app
-from db.store import upsert_query, save_analysis, save_plan, chat_add_message, set_setting, get_conn
+from db import performance
+from db.store import upsert_query, save_analysis, save_plan, chat_add_message, set_setting, get_conn, get_query_detail
+
+fixture_now = int(time.time())
+# Keep fixture windows deterministic when a full browser run lasts over a minute.
+performance.get_performance = partial(performance.get_performance, now=fixture_now)
 
 set_setting("collector_active", "false")
 for index in range(65):
@@ -28,16 +34,17 @@ for index in range(65):
     })
     if index == 0:
         payload = '<img src="/missing-test-image" onerror="window.injected=true">'
-        save_plan(query_id, "Plan hash value: 100\nTABLE ACCESS FULL ORDERS")
-        save_plan(query_id, "Plan hash value: 123\nINDEX RANGE SCAN ORDERS_ID\n" + payload)
+        save_plan(query_id, "Plan hash value: 100\n| Id | Operation |\n| 0 | TABLE ACCESS FULL ORDERS |")
+        save_plan(query_id, "Plan hash value: 123\n| Id | Operation |\n| 0 | INDEX RANGE SCAN ORDERS_ID |\n" + payload)
         save_analysis(query_id, {"score": 0, "severity": "critical", "summary": payload,
                                 "raw": "SCORE: 0\nSEVERITY: critical\nSUMMARY: Diagnostic\n\n## Diagnostic\n" + payload,
-                                "trace": [{"tool": payload, "args": {"table": payload}, "ok": False, "error": payload}]})
+                                "trace": [{"tool": payload, "args": {"table": payload}, "ok": False, "error": payload}]},
+                      expected_plan_id=get_query_detail(query_id)["query"]["plan_id"])
         chat_add_message(query_id, "assistant", payload + "\n**Diagnostic**")
         connection = get_conn()
         try:
             with connection:
-                started_at = int(time.time()) - 7200
+                started_at = fixture_now - 7200
                 elapsed = 0
                 for sample_index in range(121):
                     elapsed += 500000 if sample_index <= 105 else 1000000

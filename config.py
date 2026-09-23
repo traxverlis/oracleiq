@@ -15,15 +15,13 @@ MIN_ELAPSED_MS      = int(os.getenv("MIN_ELAPSED_MS", "0"))  # ignorer requêtes
 IGNORE_SYS_QUERIES  = os.getenv("IGNORE_SYS", "true").lower() == "true"
 
 # IA
-# Providers : openai | anthropic | ollama | github-copilot
+# Seul fournisseur pris en charge ; validation avant tout appel IA.
 AI_PROVIDER  = os.getenv("AI_PROVIDER", "github-copilot")
-AI_API_KEY   = os.getenv("AI_API_KEY", "")          # ta clé GitHub Copilot / OpenAI / Anthropic
+AI_API_KEY   = os.getenv("AI_API_KEY", "")          # compatibilite des anciennes configurations
 # Jeton GitHub (device flow) : si défini ici, prioritaire sur celui enregistré via l'administration
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-AI_MODEL     = os.getenv("AI_MODEL", "claude-sonnet-4.6")
-# GitHub Copilot endpoint : https://models.inference.ai.azure.com
-# OpenAI direct           : laisser vide
-# Ollama local            : http://localhost:11434/v1
+AI_MODEL     = os.getenv("AI_MODEL", "claude-opus-5")
+# Ancienne option, ignoree par le transport du SDK Copilot.
 AI_BASE_URL  = os.getenv("AI_BASE_URL", "https://models.inference.ai.azure.com")
 
 # Tokens max pour les analyses IA (markdown complet)

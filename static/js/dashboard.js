@@ -7,6 +7,7 @@ let items = [];
 let pages = 1;
 let loadVersion = 0;
 let searchTimer;
+let renderedRows = '';
 const params = new URLSearchParams(location.search);
 const state = {
   search: params.get('search') || '', schema: params.get('schema') || '',
@@ -43,7 +44,12 @@ function syncSelection() {
 
 function renderRows() {
   const body = document.querySelector('#queriesTable tbody');
-  const focused = document.activeElement?.dataset;
+  const signature = JSON.stringify([items, [...selected], [...analyzing]]);
+  if (signature === renderedRows) return;
+  renderedRows = signature;
+  const active = document.activeElement;
+  const focusedRow = active?.closest('#queriesTable tbody tr')?.dataset.id;
+  const focusedIndex = focusedRow ? [...active.closest('tr').querySelectorAll('input, a, button')].indexOf(active) : -1;
   body.replaceChildren();
   for (const item of items) {
     const row = document.createElement('tr');
@@ -74,7 +80,11 @@ function renderRows() {
   }
   syncSelection();
   refreshIcons();
-  if (focused?.action && focused?.id) body.querySelector(`[data-action="${focused.action}"][data-id="${focused.id}"]`)?.focus({ preventScroll: true });
+  if (focusedRow) {
+    const row = [...body.rows].find(row => row.dataset.id === focusedRow);
+    const target = row?.querySelectorAll('input, a, button')[focusedIndex];
+    (target && !target.disabled ? target : byId('tableRegion')).focus({ preventScroll: true });
+  }
 }
 
 async function loadRows() {
@@ -88,7 +98,9 @@ async function loadRows() {
     state.page = result.page;
     history.replaceState(null, '', `/?${new URLSearchParams(state)}`);
     const schemaSelect = byId('schemaFilter');
-    schemaSelect.replaceChildren(new Option('Tous les schémas', ''), ...result.schemas.map(schema => new Option(schema, schema)));
+    if (JSON.stringify([...schemaSelect.options].slice(1).map(option => option.value)) !== JSON.stringify(result.schemas)) {
+      schemaSelect.replaceChildren(new Option('Tous les schémas', ''), ...result.schemas.map(schema => new Option(schema, schema)));
+    }
     schemaSelect.value = state.schema;
     byId('rowCount').textContent = `${number(result.total)} ${state.group ? 'patterns' : 'requêtes'}`;
     byId('pageLabel').textContent = `${state.page} / ${pages}`;
