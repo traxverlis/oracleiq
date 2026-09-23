@@ -136,6 +136,7 @@ python oracleiq.py all
 Ouvrir : **http://localhost:8080**
 
 Pour analyser les requêtes capturées :
+
 ```bash
 python oracleiq.py analyze --once   # analyse une fois
 python oracleiq.py analyze          # boucle continue
@@ -184,15 +185,15 @@ docker compose exec odin rm /data/odin-backup.db
 
 ## Résolution de problèmes courants
 
-| Erreur | Cause probable | Solution |
-|--------|---------------|----------|
-| `ORA-01017: invalid username/password` | Mauvais identifiants | Vérifier `ORACLE_USER` / `ORACLE_PASSWORD` |
-| `ORA-12541: no listener` | DSN incorrect ou Oracle arrêté | Vérifier `ORACLE_DSN` |
-| `ORA-00942: table or view does not exist` | GRANTs manquants | Relancer le script SQL de l'étape 1 |
-| `ORA-01031: insufficient privileges` | GRANT manquant sur une V$ | Vérifier les GRANTs sur les vues V_ |
-| `ModuleNotFoundError: oracledb` | venv non activé | `source .venv/bin/activate` |
-| `Address already in use` | Port 8080 occupé | `python oracleiq.py web 9090` |
+| Erreur                                    | Cause probable                 | Solution                                   |
+| ----------------------------------------- | ------------------------------ | ------------------------------------------ |
+| `ORA-01017: invalid username/password`    | Mauvais identifiants           | Vérifier `ORACLE_USER` / `ORACLE_PASSWORD` |
+| `ORA-12541: no listener`                  | DSN incorrect ou Oracle arrêté | Vérifier `ORACLE_DSN`                      |
+| `ORA-00942: table or view does not exist` | GRANTs manquants               | Relancer le script SQL de l'étape 1        |
+| `ORA-01031: insufficient privileges`      | GRANT manquant sur une V$      | Vérifier les GRANTs sur les vues V\_       |
+| `ModuleNotFoundError: oracledb`           | venv non activé                | `source .venv/bin/activate`                |
+| `Address already in use`                  | Port 8080 occupé               | `python oracleiq.py web 9090`              |
 
 ---
 
-*Pour la documentation complète, voir `README.md`.*
+_Pour la documentation complète, voir `README.md`._
