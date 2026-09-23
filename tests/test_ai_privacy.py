@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from analyzer import ai_analyzer, copilot_client, data_policy as policy, oracle_tools
+from collector import connection as collector_connection
 
 
 class PrivacyTests(unittest.TestCase):
@@ -85,6 +86,42 @@ Predicate Information:
         self.assertNotIn("private", clean)
         self.assertIn("9157 | 816", clean)
         self.assertIn("9157 | 816", policy.sanitize_text(plan.split("Peeked Binds")[0]))
+
+    def test_compact_plan_keeps_tree_and_masking_markers(self):
+        plan = """SQL_ID  fixture, child number 0
+-------------------------------------
+select * from orders where name='private'
+
+Plan hash value: 42
+
+------------------------------------------------------
+| Id  | Operation                    | Name   | Rows  |
+------------------------------------------------------
+|   0 | SELECT STATEMENT             |        |       |
+|*  1 |  TABLE ACCESS BY INDEX ROWID | ORDERS |     2 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("NAME"='private')
+"""
+        compact = policy.compact_plan(plan, omit_sql=True)
+        self.assertNotIn("select * from orders", compact)
+        self.assertIn("|*  1|  TABLE ACCESS BY INDEX ROWID|ORDERS|2|", compact)
+        self.assertLess(len(compact), len(plan))
+        self.assertTrue(collector_connection.is_execution_plan_available(compact))
+        clean = policy.sanitize_text(compact)
+        self.assertNotIn("private", clean)
+        self.assertIn("|ORDERS|2|", clean)
+
+    def test_oversized_tool_result_shortens_fields_and_stays_parseable(self):
+        plan = "\n".join(f"|{i}| TABLE ACCESS FULL|T{i}|1|" for i in range(4000))
+        payload = policy.tool_payload({"source": "cursor", "plan": plan, "sql_id": "fixture"})
+        self.assertLessEqual(len(payload), policy.MAX_TOOL_RESULT_CHARS)
+        data = json.loads(payload)
+        self.assertTrue(data["truncated"])
+        self.assertEqual(data["result"]["sql_id"], "fixture")
+        self.assertTrue(data["result"]["plan"].startswith("|0| TABLE ACCESS FULL|T0|1|"))
+        self.assertIn("caracteres tronques]", data["result"]["plan"])
 
     def test_preview_is_default_masked_and_raw_requires_exact_true(self):
         row = {"sql_text": "select * from orders where id=987 and name='private'",

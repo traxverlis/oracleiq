@@ -181,6 +181,25 @@ class OracleLimitsTests(unittest.TestCase):
         self.assertIn("error", oracle_tools.explain_plan(connection, "fixture"))
         connection.cursor.assert_not_called()
 
+    def test_long_view_text_is_masked_then_paged_with_columns_once(self):
+        text = "select a.x, 'private' as y\n" + "join t on t.id = a.id\n" * 2000
+        responses = lambda offset: [
+            [{"object_name": "V", "object_type": "VIEW", "owner": "APP"}],
+            [{"text_length": len(text), "text": text}],
+            *([[{"column_name": "X", "data_type": "NUMBER", "nullable": "Y"}]] if not offset else [])]
+        with patch.object(oracle_tools, "raw_values_enabled", return_value=False):
+            with patch.object(oracle_tools, "_query", side_effect=responses(0)):
+                first = oracle_tools.describe_object(None, "V", "APP")["details"]["VIEW"]
+            with patch.object(oracle_tools, "_query", side_effect=responses(1)):
+                second = oracle_tools.describe_object(None, "V", "APP",
+                                                      text_offset=first["next_text_offset"])["details"]["VIEW"]
+        self.assertNotIn("private", first["view_text"])
+        self.assertTrue(first["view_text"].endswith("\n"))
+        self.assertEqual(first["columns"], [["X", "NUMBER", "Y"]])
+        self.assertNotIn("columns", second)
+        self.assertTrue(second["view_text"].startswith("join t"))
+        self.assertIn("error", oracle_tools.describe_object(None, "V", text_offset="-1"))
+
     def test_shared_parsing_schema_restores_after_body_exception(self):
         connection = MagicMock()
         cursor = connection.cursor.return_value

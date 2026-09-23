@@ -35,7 +35,7 @@ class NativeModeTests(unittest.TestCase):
         self.assertEqual(chat.call_args.kwargs["system"], "Custom native")
         self.assertEqual(chat.call_args.kwargs["tools"], [])
         self.assertNotIn("X" * 101, chat.call_args.kwargs["messages"][0]["content"])
-        self.assertIn("[plan tronqué...]", chat.call_args.kwargs["messages"][0]["content"])
+        self.assertIn("[plan tronqué : ", chat.call_args.kwargs["messages"][0]["content"])
 
     def test_default_prompt_allows_conclusion_without_calling_available_tools(self):
         from analyzer.oracle_tools import SYSTEM_NATIVE_ANALYZE, SYSTEM_NATIVE_CHAT

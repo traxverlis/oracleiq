@@ -78,11 +78,11 @@ class ApiReliabilityTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/settings", json={"ai_send_raw_values": []}).status_code, 422)
 
     def test_settings_reject_limits_above_effective_ai_policy(self):
-        for values in ({"ai_max_tokens": 32001}, {"plan_truncate": 16001},
+        for values in ({"ai_max_tokens": 32001}, {"plan_truncate": 40001},
                        {"system_prompt": "x" * 20001}):
             self.assertEqual(self.client.post("/api/settings", json=values).status_code, 422)
         response = self.client.post("/api/settings", json={
-            "ai_max_tokens": 32000, "plan_truncate": 16000, "system_prompt": "x" * 20000})
+            "ai_max_tokens": 32000, "plan_truncate": 40000, "system_prompt": "x" * 20000})
         self.assertEqual(response.status_code, 200)
 
     def test_model_refresh_refuses_noncanonical_provider_before_network(self):

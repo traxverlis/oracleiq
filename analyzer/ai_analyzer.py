@@ -20,7 +20,7 @@ from analyzer.data_policy import (
     AIPolicyError, LIMITS, WARNINGS, MAX_SQL_CHARS, MAX_PLAN_CHARS, MAX_INPUT_CHARS,
     MAX_TOOL_RESULT_CHARS, MAX_RESPONSE_CHARS, MAX_TOOL_CALLS, MAX_TURNS, ANALYSIS_TIMEOUT_SECONDS,
     check_budget, prepare_messages, prepare_request, raw_values_enabled, require_copilot, sanitize_data,
-    tool_payload,
+    tool_payload, compact_plan,
 )
 
 # ─────────────────────────────────────────────
@@ -202,6 +202,8 @@ def _build_initial_prompt(row: dict) -> str:
     from collector.connection import is_execution_plan_available
     plan_text = row.get("plan_text", "") or ""
     plan_available = is_execution_plan_available(plan_text)
+    if plan_available:
+        plan_text = compact_plan(plan_text, omit_sql=True)
     if len(row.get("sql_text") or "") > MAX_SQL_CHARS:
         raise AIPolicyError("Budget SQL IA depasse ; aucune transmission effectuee.")
     try:
@@ -209,7 +211,7 @@ def _build_initial_prompt(row: dict) -> str:
     except (ValueError, TypeError):
         plan_limit = MAX_PLAN_CHARS
     if len(plan_text) > plan_limit:
-        plan_text = plan_text[:plan_limit] + "\n[plan tronqué...]"
+        plan_text = plan_text[:plan_limit] + f"\n[plan tronqué : {len(plan_text) - plan_limit} caractères omis]"
     sql_id = row.get("sql_id", "")
     if not plan_available:
         plan_section = f"""Non disponible.

@@ -125,7 +125,7 @@ class SettingsPatch(BaseModel):
     collector_active: bool | None = None
     ai_model: str | None = Field(default=None, min_length=1, max_length=200)
     ai_max_tokens: int | None = Field(default=None, ge=256, le=32000)
-    plan_truncate: int | None = Field(default=None, ge=100, le=16000)
+    plan_truncate: int | None = Field(default=None, ge=100, le=40000)
     oracle_dsn: str | None = Field(default=None, max_length=1000)
     oracle_user: str | None = Field(default=None, max_length=128)
     oracle_password: str | None = Field(default=None, max_length=1024)
@@ -392,7 +392,7 @@ def get_all_settings(request: Request):
         raise HTTPException(403, "Droits administrateur requis")
     values = get_settings({
         "analyzer_mode": "manual", "collector_active": "true",
-        "ai_model": AI_MODEL, "ai_max_tokens": "8000", "plan_truncate": "16000",
+        "ai_model": AI_MODEL, "ai_max_tokens": "8000", "plan_truncate": "40000",
         "oracle_dsn": ORACLE_DSN, "oracle_user": ORACLE_USER, "oracle_password": ORACLE_PASSWORD,
         "tools_enabled": "", "gather_stats_enabled": "false", "system_prompt": "",
         "ai_send_raw_values": "false",

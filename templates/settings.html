@@ -451,7 +451,7 @@
           <div class="setting-info">
             <label for="plan_truncate">Taille max du plan Oracle</label>
             <span class="setting-desc">Tronque le plan au-delà de cette limite pour ne pas surcharger le contexte
-              IA. Plafond : 16000 caractères.</span>
+              IA (colonnes du plan compactées avant la limite). Plafond : 40000 caractères.</span>
           </div>
           <div class="setting-control">
             <select id="plan_truncate" class="setting-select" onchange="save('plan_truncate', parseInt(this.value))">
@@ -461,7 +461,9 @@
               </option>
               <option value="10000" {% if settings.plan_truncate==10000 %}selected{% endif %}>10000 chars — étendu
               </option>
-              <option value="16000" {% if settings.plan_truncate==16000 %}selected{% endif %}>16000 chars — plafond ★</option>
+              <option value="16000" {% if settings.plan_truncate==16000 %}selected{% endif %}>16000 chars</option>
+              <option value="24000" {% if settings.plan_truncate==24000 %}selected{% endif %}>24000 chars</option>
+              <option value="40000" {% if settings.plan_truncate==40000 %}selected{% endif %}>40000 chars — plafond ★</option>
             </select>
           </div>
         </div>

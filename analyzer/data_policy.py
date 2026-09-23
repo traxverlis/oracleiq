@@ -9,10 +9,10 @@ import time
 
 MAX_INPUT_CHARS = 400_000
 MAX_HISTORY_MESSAGES = 80
-MAX_TOOL_RESULT_CHARS = 32_000
+MAX_TOOL_RESULT_CHARS = 48_000
 MAX_RESPONSE_CHARS = 48_000
 MAX_SQL_CHARS = 40_000
-MAX_PLAN_CHARS = 16_000
+MAX_PLAN_CHARS = 40_000
 MAX_SYSTEM_CHARS = 20_000
 MAX_TOOL_CALLS = 30
 MAX_TURNS = 32
@@ -211,12 +211,56 @@ def sanitize_data(value, raw=False, key=""):
     return value
 
 
+_PLAN_GRID_HEADER = re.compile(r"^\s*\|\s*Id\s*\|\s*Operation\b")
+
+
+def compact_plan(text, omit_sql=False):
+    """Remove DBMS_XPLAN column padding (about half the size); operation indentation is kept."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("Plan hash value")), None)
+    if omit_sql and start and lines[0].startswith("SQL_ID"):
+        lines = [lines[0], "[texte SQL omis : identique au SQL de la requete analysee]", ""] + lines[start:]
+    output, operation = [], None
+    for line in lines:
+        line = line.rstrip()
+        if len(line) > 1 and line.startswith("|") and line.endswith("|"):
+            cells = line[1:-1].split("|")
+            if _PLAN_GRID_HEADER.match(line):
+                operation = next(i for i, cell in enumerate(cells) if cell.strip() == "Operation")
+            line = "|" + "|".join(cell.rstrip() if i == operation else cell.strip()
+                                   for i, cell in enumerate(cells)) + "|"
+        elif len(line) > 10 and set(line.strip()) == {"-"}:
+            line = "-" * 10
+        output.append(line)
+    return "\n".join(output)
+
+
+def _shorten(value, chars, items):
+    if isinstance(value, str) and len(value) > chars:
+        return value[:chars] + f"\n[... {len(value) - chars} caracteres tronques]"
+    if isinstance(value, dict):
+        return {k: _shorten(v, chars, items) for k, v in value.items()}
+    if isinstance(value, list):
+        kept = [_shorten(v, chars, items) for v in value[:items]]
+        return kept + ([f"[... {len(value) - items} elements tronques]"] if len(value) > items else [])
+    return value
+
+
 def tool_payload(result):
     """Serialize an already sanitized tool result within the per-result budget."""
     full = payload = json.dumps(result, default=str, ensure_ascii=False)
+    chars, items = MAX_TOOL_RESULT_CHARS, 1000
+    # Shorten the longest fields first: a blind prefix of the JSON is double-escaped and hard to read.
+    while len(payload) > MAX_TOOL_RESULT_CHARS and chars > 500:
+        chars, items = int(chars * 0.8), max(10, int(items * 0.8))
+        payload = json.dumps({
+            "truncated": True, "original_chars": len(full),
+            "warning": "Resultat tronque : champs longs raccourcis et signales par un marqueur [...]. "
+                       "Cibler un objet, une partie ou une periode plus restreint si la suite est necessaire.",
+            "result": _shorten(result, chars, items)}, default=str, ensure_ascii=False)
     cut = MAX_TOOL_RESULT_CHARS - 600
     while len(payload) > MAX_TOOL_RESULT_CHARS:
-        # Escaping can grow the partial text, hence the shrinking loop.
+        # Last resort (many small fields). Escaping can grow the partial text, hence the shrinking loop.
         payload = json.dumps({
             "truncated": True, "original_chars": len(full),
             "warning": "Resultat tronque : cibler un objet ou une periode plus restreint si la suite est necessaire.",

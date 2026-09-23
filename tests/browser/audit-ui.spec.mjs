@@ -54,8 +54,8 @@ for (const failure of [403, 500, 'network']) {
 test('settings writes are serialized and prompt success updates saved state', async ({ page }) => {
   await login(page);
   await expect(page.locator('#systemPromptEditor')).toHaveAttribute('maxlength', '20000');
-  await expect(page.locator('#plan_truncate option[value="16000"]')).toHaveCount(1);
-  expect(await page.locator('#plan_truncate').evaluate(select => Math.max(...[...select.options].map(option => Number(option.value))))).toBe(16000);
+  await expect(page.locator('#plan_truncate option[value="40000"]')).toHaveCount(1);
+  expect(await page.locator('#plan_truncate').evaluate(select => Math.max(...[...select.options].map(option => Number(option.value))))).toBe(40000);
   expect(await page.locator('#ai_max_tokens').evaluate(select => Math.max(...[...select.options].map(option => Number(option.value))))).toBe(32000);
   const requests = [];
   let releaseFirst;

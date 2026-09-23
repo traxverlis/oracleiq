@@ -5,7 +5,7 @@ operations explicitement activees. Un SELECT peut appeler des fonctions a effets
 """
 import re
 from contextlib import contextmanager
-from analyzer.data_policy import AIPolicyError, check_budget
+from analyzer.data_policy import AIPolicyError, check_budget, compact_plan, mask_sql, raw_values_enabled
 
 
 class _DeadlineCursor:
@@ -97,7 +97,8 @@ _FORBIDDEN = re.compile(
     re.IGNORECASE
 )
 
-_MAX_VIEW_TEXT = 12_000
+_MAX_VIEW_TEXT = 20_000
+_MAX_PLAN_LINES = 3000
 
 
 def _safe_name(name: str) -> str:
@@ -275,9 +276,9 @@ def _pack_access(conn) -> str:
 def _xplan(conn, sql: str, **binds) -> tuple[str, bool]:
     with conn.cursor() as cur:
         cur.execute(sql, binds)
-        lines = cur.fetchmany(501)
-    text = [str(v.read() if hasattr(v, "read") else v) for (v, *_) in lines[:500] if v is not None]
-    return "\n".join(text), len(lines) > 500
+        lines = cur.fetchmany(_MAX_PLAN_LINES + 1)
+    text = [str(v.read() if hasattr(v, "read") else v) for (v, *_) in lines[:_MAX_PLAN_LINES] if v is not None]
+    return "\n".join(text), len(lines) > _MAX_PLAN_LINES
 
 
 def _optional_int(value):
@@ -323,7 +324,7 @@ def cursor_plan(conn, sql_id: str, plan_hash_value=None, child_number=None) -> d
         return {"error": "DBMS_XPLAN n'a pas retourne de plan valide.", "source": source}
     return {"source": source, "sql_id": sid, "child_number": child, "plan_hash_value": phv,
             "parsing_schema": found[0]["parsing_schema_name"] if found else None,
-            "plan": plan, "truncated": truncated}
+            "plan": compact_plan(plan, omit_sql=True), "truncated": truncated}
 
 
 def sql_monitor(conn, sql_id: str, sql_exec_id=None, plan_hash_value=None) -> dict:
@@ -627,11 +628,15 @@ def describe_table(conn, table_name: str, schema: str = "", columns=None) -> dic
     }
 
 
-def describe_object(conn, object_name: str, schema: str = "") -> dict:
+def describe_object(conn, object_name: str, schema: str = "", text_offset=0) -> dict:
     """Description complète de n'importe quel objet Oracle : table, vue, procédure, fonction,
     package, trigger, séquence, synonyme, type, index, etc."""
     n = _safe_name(object_name)
     s = _safe_name(schema) if schema else None
+    try:
+        offset = _optional_int(text_offset) or 0
+    except ValueError:
+        return {"error": "text_offset doit etre un entier positif."}
     params = {"obj": n}
     where_owner = " AND OWNER = :sch" if s else ""
     if s:
@@ -661,22 +666,32 @@ def describe_object(conn, object_name: str, schema: str = "") -> dict:
             result["details"][obj_type] = describe_table(conn, n, owner)
 
         elif obj_type == "VIEW":
-            # Colonnes de la vue
-            cols = _query(conn, """
-                SELECT COLUMN_NAME, DATA_TYPE, COLUMN_ID, NULLABLE
-                FROM ALL_TAB_COLUMNS
-                WHERE TABLE_NAME = :obj AND OWNER = :sch
-                ORDER BY COLUMN_ID
-            """, p)
             # ALL_VIEWS.TEXT (LONG) est lu en str par python-oracledb ; TEXT_LENGTH donne la taille réelle.
             view = _query(conn, "SELECT TEXT_LENGTH, TEXT FROM ALL_VIEWS WHERE VIEW_NAME = :obj AND OWNER = :sch", p)
             text = str((view[0].get("text") if view else "") or "")
-            result["details"][obj_type] = {
-                "view_text": text[:_MAX_VIEW_TEXT] if view else "(texte non disponible)",
+            # Mask before paging: a part starting inside a literal would otherwise expose its value.
+            text = text if raw_values_enabled() else mask_sql(text)
+            end = offset + _MAX_VIEW_TEXT
+            if end < len(text):
+                end = max(text.rfind("\n", offset, end) + 1, offset + _MAX_VIEW_TEXT // 2)
+            details = {
+                "view_text": text[offset:end] if view else "(texte non disponible)",
                 "text_length": view[0].get("text_length") if view else None,
-                "view_text_truncated": len(text) > _MAX_VIEW_TEXT,
-                "columns": cols,
+                "text_offset": offset,
+                "view_text_truncated": end < len(text),
             }
+            if end < len(text):
+                details["next_text_offset"] = end
+            if offset == 0:
+                cols = _query(conn, """
+                    SELECT COLUMN_NAME, DATA_TYPE, NULLABLE
+                    FROM ALL_TAB_COLUMNS
+                    WHERE TABLE_NAME = :obj AND OWNER = :sch
+                    ORDER BY COLUMN_ID
+                """, p)
+                details["column_fields"] = ["column_name", "data_type", "nullable"]
+                details["columns"] = [[c.get("column_name"), c.get("data_type"), c.get("nullable")] for c in cols]
+            result["details"][obj_type] = details
 
         elif obj_type in ("PROCEDURE", "FUNCTION"):
             src = _query(conn, """
@@ -983,16 +998,16 @@ def explain_plan(conn, sql_id: str, child_number: int | None = None) -> dict:
                 try:
                     cur.execute(f"EXPLAIN PLAN SET STATEMENT_ID='{statement_id}' INTO {plan_table} "
                                 f"FOR {sql_text.rstrip().rstrip(';')}")
-                    cur.execute("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY(:table_name, :stmt_id, 'ALL'))",
+                    cur.execute("SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY(:table_name, :stmt_id, 'TYPICAL'))",
                                 table_name=plan_table, stmt_id=statement_id)
-                    lines = cur.fetchmany(501)
-                    plan = "\n".join(str(line[0]) for line in lines[:500])
+                    lines = cur.fetchmany(_MAX_PLAN_LINES + 1)
+                    plan = "\n".join(str(line[0]) for line in lines[:_MAX_PLAN_LINES])
                     if not is_execution_plan_available(plan):
                         result = {"error": "DBMS_XPLAN n'a pas retourne de plan valide.", "plan_valid": False}
                     else:
                         result = {"source": "explain_plan", "plan_kind": "estimated", "plan_valid": True,
                                   "sql_id": sid, "child_number": child, "parsing_schema": schema,
-                                  "plan": plan, "truncated": len(lines) > 500,
+                                  "plan": compact_plan(plan), "truncated": len(lines) > _MAX_PLAN_LINES,
                                   "warning": "Plan estime : environnement optimiseur actuel, sans execution mesuree ni valeurs de binds garanties. Le parsing peut invoquer des politiques ou fonctions Oracle."}
                 finally:
                     cleanup = conn.cleanup_cursor() if isinstance(conn, _DeadlineConnection) else conn.cursor()
@@ -1405,7 +1420,7 @@ TOOL: <nom_outil>(<argument1>, <argument2>)
 Outils disponibles :
 - `describe_table(table_name, schema?)` — description complète : colonnes, index, contraintes, taille (remplace table_stats/index_list/column_stats/table_constraints)
 - `table_dml_since_stats(table_name, schema?)` — INSERTs/UPDATEs/DELETEs non analysés depuis la dernière collecte de stats
-- `describe_object(object_name, schema?)` — N'IMPORTE QUEL objet : vue, procédure, package, trigger, séquence, synonyme...
+- `describe_object(object_name, schema?, text_offset?)` — N'IMPORTE QUEL objet : vue, procédure, package, trigger, séquence, synonyme...
 - `describe_mview(mview_name, schema?)` — définition + log MV en un seul appel (remplace mview_definition + mview_logs)
 - `sql_plan_history(sql_id)` — curseurs en mémoire (child_number, plan_hash_value, stats) depuis V$SQL
 - `cursor_plan(sql_id, plan_hash_value?, child_number?)` — plan réellement utilisé (curseur ou AWR)
@@ -1562,7 +1577,8 @@ TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "object_name": {"type": "string", "description": "Nom de l'objet Oracle (respecter la casse exacte)."},
-                    "schema":      {"type": "string", "description": "Schéma propriétaire (optionnel)."}
+                    "schema":      {"type": "string", "description": "Schéma propriétaire (optionnel)."},
+                    "text_offset": {"type": "integer", "minimum": 0, "description": "Vue longue : reprendre le texte à next_text_offset (colonnes omises au-delà de la première partie)."}
                 },
                 "required": ["object_name"]
             }
