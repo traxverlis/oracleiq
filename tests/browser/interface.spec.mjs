@@ -45,7 +45,7 @@ test('detail and export sanitize stored HTML', async ({ page }, testInfo) => {
   await page.goto('/query/1');
   await expect(page.locator('#analysisMarkdownDisplay h2')).toHaveText('Diagnostic');
   const sqlSection = page.locator('section.card').first();
-  await expect(sqlSection).toHaveCSS('border-radius', '10px');
+  await expect(sqlSection).toHaveCSS('border-radius', '16px');
   await expect(sqlSection).toHaveCSS('padding-left', '24px');
   await expect(sqlSection).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
   await expect(page.locator('.score-inline')).toContainText('0');

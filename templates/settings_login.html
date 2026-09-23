@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ODIN — Accès Administration</title>
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d0f14">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/static/vendor/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/css/main.css?v=login1">
 <style>
   .login-wrap {
@@ -85,15 +89,14 @@
     margin-bottom: 18px;
     text-align: left;
   }
-  .login-lock { font-size: 36px; margin-bottom: 16px; }
 </style>
 <link rel="stylesheet" href="/static/css/responsive.css">
+<link rel="stylesheet" href="/static/css/theme.css">
 </head>
 <body>
 <div class="login-wrap">
   <div class="login-card">
-    <div class="login-lock">🔐</div>
-    <div class="login-logo">🔮 ODI<span>N</span></div>
+    <div class="login-logo">ODI<span>N</span></div>
     <div class="login-sub">Connexion</div>
 
     {% if error %}

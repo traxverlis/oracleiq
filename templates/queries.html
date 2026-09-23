@@ -4,8 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ODIN — Requêtes Oracle</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0d0f14">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/vendor/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/css/main.css?v=2">
   <link rel="stylesheet" href="/static/css/responsive.css">
+  <link rel="stylesheet" href="/static/css/theme.css">
   <script defer src="/static/vendor/lucide.js"></script>
   <script defer src="/static/js/common.js"></script>
   <script defer src="/static/js/dashboard.js"></script>
@@ -14,7 +19,7 @@
 <body data-admin="{{ 'true' if is_admin else 'false' }}">
   <a class="skip-link" href="#main">Aller aux requêtes</a>
   <nav class="navbar" aria-label="Navigation principale">
-    <a class="nav-brand" href="/">🔮 ODI<span class="nav-title-iq">N</span></a>
+    <a class="nav-brand" href="/">ODI<span class="nav-title-iq">N</span></a>
     <span class="nav-sub">Requêtes Oracle</span>
     <span id="statusCollectorNav" class="nav-status-pill">Connexion…</span>
     <span id="statusModeNav" class="nav-status-pill"></span>
