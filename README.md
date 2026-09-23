@@ -14,9 +14,12 @@
 connexion. Voir [MAINTENANCE.md](MAINTENANCE.md) pour les rôles, la migration,
 les limites Oracle, les sauvegardes et les tests isolés.
 
-**ODIN** capture en continu les requêtes SQL depuis la vue dynamique `V$SQL` d'Oracle Database, les stocke localement, puis les soumet à un modèle d'IA (Claude, GPT-4, Ollama…) pour analyse approfondie.
+**ODIN** capture en continu les requêtes SQL depuis la vue dynamique `V$SQL` d'Oracle Database, les stocke localement, puis les soumet à un modèle du catalogue GitHub Copilot pour analyse approfondie.
 
-L'IA peut interroger Oracle en lecture seule pendant l'analyse (statistiques de tables, index, historique AWR, bind variables) pour enrichir son diagnostic — c'est ce qu'on appelle le **mode agentique**.
+L'IA peut consulter des statistiques Oracle pendant l'analyse pour enrichir son
+diagnostic — c'est le **mode agentique**. Le SELECT libre et la collecte de
+statistiques sont des options distinctes, desactivees par defaut. Les privileges
+Oracle restent la barriere de protection ; voir [MAINTENANCE.md](MAINTENANCE.md).
 
 ### Ce que fait ODIN
 
@@ -27,7 +30,7 @@ L'IA peut interroger Oracle en lecture seule pendant l'analyse (statistiques de 
 - 💬 **Chat IA contextuel** par requête : posez des questions sur n'importe quelle requête
 - 📌 **Bind variables** : visualisation des valeurs capturées depuis `V$SQL_BIND_CAPTURE`
 - 📊 **Dashboard web** avec thème dark ambre, navigation historique, export PDF
-- ⚙️ **Settings web** : connexion Oracle, choix du provider IA, mode d'analyse
+- ⚙️ **Settings web** : connexion Oracle, modèle Copilot, confidentialité et mode d'analyse
 
 ---
 
@@ -45,9 +48,9 @@ oracleiq/
 │   └── oracle_collector.py   ← Polling V$SQL, récupération plans, upsert SQLite
 │
 ├── analyzer/
-│   ├── ai_analyzer.py        ← Boucle d'analyse IA agentique (multi-providers)
+│   ├── ai_analyzer.py        ← Boucle d'analyse agentique Copilot
 │   ├── copilot_client.py     ← Connecteur SDK officiel GitHub Copilot
-│   └── oracle_tools.py       ← Outils Oracle read-only disponibles à l'IA
+│   └── oracle_tools.py       ← Outils Oracle avec autorisations explicites
 │
 ├── api/
 │   └── app.py               ← Application FastAPI (REST + templates Jinja2)
@@ -83,9 +86,7 @@ oracleiq/
 
 - `oracledb >= 2.0.0` — driver Oracle pur Python (pas besoin d'Instant Client pour thin mode)
 - `fastapi >= 0.111.0` + `uvicorn` — interface web
-- `openai >= 1.30.0` — client OpenAI/Ollama
 - `github-copilot-sdk == 1.0.13` — SDK officiel et runtime Copilot épinglé
-- `anthropic >= 0.28.0` — client Anthropic Claude
 - `rich >= 13.7.0` — affichage console
 - `jinja2` — templates HTML
 
@@ -95,14 +96,11 @@ Un compte Oracle avec les privilèges listés dans la section **Permissions Orac
 
 ### Clé API IA
 
-Au moins l'un des providers suivants :
+GitHub Copilot est le seul fournisseur pris en charge :
 
 | Provider | Où obtenir la clé |
 |----------|------------------|
 | GitHub Copilot | [Jeton fine-grained personnel](https://github.com/settings/personal-access-tokens/new), permission **Copilot Requests** |
-| OpenAI | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
-| Anthropic | [console.anthropic.com](https://console.anthropic.com/) |
-| Ollama | Pas de clé — installation locale : [ollama.ai](https://ollama.ai) |
 
 ---
 
@@ -190,6 +188,8 @@ python oracleiq.py analyze --once    Une passe d'analyse puis quitte
 python oracleiq.py web               Interface web seule (port 8080)
 python oracleiq.py web 9090          Interface web sur un port personnalisé
 python oracleiq.py all               Tout en parallèle (collect + analyze + web)
+python oracleiq.py backup copie.db   Sauvegarde SQLite coherente vers un nouveau fichier
+python oracleiq.py restore copie.db restauree.db  Restauration sans ecrasement
 ```
 
 Le mode `all` lance trois processus parallèles via `multiprocessing`. Arrêt propre avec `Ctrl+C`.
@@ -260,18 +260,15 @@ Si vous ne pouvez pas obtenir les GRANTs DBA, ODIN fonctionne en mode dégradé 
 
 ---
 
-## Providers IA supportés
+## Fournisseur IA
 
 | Provider | `AI_PROVIDER` | Modèles recommandés | `AI_BASE_URL` |
 |----------|--------------|---------------------|--------------|
 | GitHub Copilot | `github-copilot` | Catalogue du compte dans Administration > Modèles | Gérée par le SDK |
-| OpenAI | `openai` | `gpt-4o`, `gpt-4o-mini` | *(laisser vide)* |
-| Anthropic | `anthropic` | `claude-3-5-sonnet-20241022`, `claude-opus-4-5` | *(non utilisé)* |
-| Ollama (local) | `ollama` | `llama3`, `mistral`, `qwen2.5-coder` | `http://localhost:11434/v1` |
 
 ### GitHub Copilot (recommandé)
 
-Le provider par défaut utilise le SDK officiel. Créer un PAT fine-grained avec le
+Le fournisseur Copilot utilise le SDK officiel. Créer un PAT fine-grained avec le
 compte personnel comme Resource owner et la permission de compte **Copilot Requests**.
 Les PAT classic (`ghp_`) ne sont pas supportés. Les modèles accessibles, quotas et
 frais dépendent du forfait et des politiques Copilot du compte.
@@ -280,38 +277,28 @@ frais dépendent du forfait et des politiques Copilot du compte.
 AI_PROVIDER=github-copilot
 GITHUB_TOKEN=github_pat_REMPLACER_PAR_VOTRE_JETON
 AI_MODEL=claude-sonnet-4.6
-AI_BASE_URL=https://models.inference.ai.azure.com
 ```
 
-### Ollama (sans abonnement, 100% local)
-
-Pour une utilisation entièrement locale et gratuite. Performances moindres mais aucun coût et aucune donnée envoyée à l'extérieur.
-
-```bash
-# Installer Ollama
-curl -fsSL https://ollama.ai/install.sh | sh
-ollama pull llama3
-```
-
-```ini
-AI_PROVIDER=ollama
-AI_API_KEY=ollama
-AI_MODEL=llama3
-AI_BASE_URL=http://localhost:11434/v1
-```
+Les configurations `openai`, `anthropic` et `ollama` ne sont plus prises en charge
+et sont refusees avant tout appel IA. Il n'existe pas de basculement automatique
+vers un autre fournisseur. La selection Claude/OpenAI/Google du catalogue designe
+des modeles accessibles **via Copilot**, pas des fournisseurs directs.
 
 ---
 
 ## Variables d'environnement
 
 Toutes les variables peuvent être définies dans le fichier `.env` à la racine du projet.
+Le chargeur accepte les guillemets, les commentaires et le BOM UTF-8. Les variables
+deja presentes dans l'environnement restent prioritaires. Les expressions `${...}`
+ne sont pas interpretees, notamment dans les mots de passe.
 
 ### Connexion Oracle
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `ORACLE_DSN` | `localhost:1521/ORCL` | DSN Oracle au format `host:port/service_name` |
-| `ORACLE_USER` | `system` | Nom d'utilisateur Oracle |
+| `ORACLE_USER` | *(vide)* | Nom d'utilisateur Oracle dedie |
 | `ORACLE_PASSWORD` | *(vide)* | Mot de passe Oracle |
 
 ### Collecteur
@@ -326,18 +313,16 @@ Toutes les variables peuvent être définies dans le fichier `.env` à la racine
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `AI_PROVIDER` | `github-copilot` | Provider : `openai`, `anthropic`, `ollama`, `github-copilot` |
-| `AI_API_KEY` | *(vide)* | Clé API OpenAI/Anthropic/Ollama, ignorée par Copilot |
+| `AI_PROVIDER` | `github-copilot` | Seule valeur acceptee |
 | `GITHUB_TOKEN` | *(vide)* | Jeton Copilot prioritaire sur celui enregistré dans Administration > Modèles |
-| `AI_MODEL` | `claude-sonnet-4.6` | Modèle à utiliser (dépend du provider) |
-| `AI_BASE_URL` | `https://models.inference.ai.azure.com` | URL de base de l'API (vide pour OpenAI direct) |
-| `AI_MAX_TOKENS` | `8000` | Nombre maximum de tokens pour une analyse |
+| `AI_MODEL` | `claude-opus-5` | Modele a verifier dans le catalogue de votre compte |
+| `AI_MAX_TOKENS` | `8000` | Longueur souhaitee, pas un plafond garanti par le SDK |
 
 ### Interface Web
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `WEB_HOST` | `0.0.0.0` | Adresse d'écoute du serveur web |
+| `WEB_HOST` | `127.0.0.1` | Adresse d'écoute du serveur web |
 | `WEB_PORT` | `8080` | Port du serveur web |
 
 ---
@@ -355,7 +340,7 @@ Toutes les variables peuvent être définies dans le fichier `.env` à la racine
 - Score de qualité 0-100 par requête
 - Sévérité : `ok` (≥80) / `warning` (50-79) / `critical` (<50)
 - Résumé + problèmes détectés + recommandations SQL concrètes
-- Jusqu'à 3 tours d'outils Oracle pendant l'analyse (mode agentique)
+- Appels Oracle bornes pendant l'analyse, avec budgets de contexte et delai global
 - Types de problèmes identifiés : `FULL_TABLE_SCAN`, `MISSING_INDEX`, `BAD_JOIN_ORDER`, `CARTESIAN_PRODUCT`, `STALE_STATS`, `NON_SARGABLE`, `EXCESSIVE_BUFFER_GETS`, `HIGH_DISK_READS`, `MISSING_BIND_VARS`
 
 ### Outils Oracle disponibles à l'IA
@@ -397,10 +382,13 @@ Pour passer en mode **automatique** (analyse continue de toutes les nouvelles re
 1. Ouvrez les **Settings** dans l'interface web
 2. Changez le mode d'analyse sur "Automatique"
 
-Ou via la commande :
+Le processus suivant applique le mode enregistre dans les Settings ; le lancer
+ne passe pas a lui seul le mode en automatique :
 ```bash
 python oracleiq.py analyze
 ```
+
+Pour une seule passe manuelle, utiliser `python oracleiq.py analyze --once`.
 
 ---
 
@@ -412,8 +400,8 @@ ODIN stocke tout dans un fichier SQLite (`oracleiq.db`) :
 |-------|---------|
 | `queries` | Requêtes SQL capturées avec leurs statistiques d'exécution |
 | `execution_plans` | Plans d'exécution (texte brut DBMS_XPLAN) |
-| `analyses` | Résultats des analyses IA (JSON) |
-| `chat_messages` | Historique des conversations IA par requête |
+| `ai_analyses` | Résultats des analyses IA et plan de reference |
+| `query_chats` | Historique des conversations IA par requête |
 | `settings` | Paramètres modifiables via l'interface web |
 | `analyzing_queue` | File d'attente des analyses en cours |
 
@@ -422,8 +410,8 @@ ODIN stocke tout dans un fichier SQLite (`oracleiq.db`) :
 ## Logs et débogage
 
 ```bash
-# Logs d'erreur du collecteur
-cat /tmp/oracleiq_err.log
+# Les erreurs du collecteur sont emises dans les journaux du processus.
+# Configurer leur collecte et rotation dans le superviseur de deploiement.
 
 # Tester la connexion Oracle manuellement
 python3 -c "
@@ -451,7 +439,7 @@ print('OK:', conn.version)
 - [ ] Alertes email/webhook sur sévérité `critical`
 - [ ] Export des recommandations en scripts SQL
 - [ ] Multi-instance Oracle
-- [ ] Authentification de l'interface web
+- [x] Authentification de l'interface web (administrateur et lecture seule)
 
 ---
 

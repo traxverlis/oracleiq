@@ -10,6 +10,8 @@ import time
 import threading
 import queue as _queue_mod
 import os
+import logging
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -22,9 +24,12 @@ from starlette.concurrency import run_in_threadpool
 from jinja2 import Environment, FileSystemLoader
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from db.store import get_all_queries, get_query_detail, get_conn, get_setting, set_setting
-from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-from collector.connection import connect_oracle, query_execution_enabled
+from db.store import get_all_queries, get_query_detail, get_conn, get_setting, set_setting, get_settings, set_settings
+from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD, AI_MODEL
+from collector.connection import (
+    connect_oracle, query_execution_enabled, get_oracle_settings, assert_query_source,
+    is_execution_plan_available,
+)
 import analyzer.copilot_client as _copilot_client  # import au niveau module pour éviter le cache stale dans les threads
 
 # Suivi en mémoire des analyses en cours (survit aux refreshs, pas aux redémarrages serveur)
@@ -32,6 +37,67 @@ analyzing_ids: set[int] = set()
 # Queues SSE par query_id — permet la reconnexion si refresh pendant analyse native
 _stream_queues: dict[int, list[_queue_mod.Queue]] = {}
 _analysis_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="odin-analysis")
+_analysis_lock = threading.RLock()
+_analysis_results: dict[int, tuple[float, dict]] = {}
+_chat_ids: set[int] = set()
+_log = logging.getLogger("oracleiq.api")
+_STREAM_TIMEOUT = 600
+
+
+def _query_row(query_id: int) -> dict:
+    connection = get_conn()
+    try:
+        row = connection.execute("""
+            SELECT q.*, ep.plan_text, ep.id AS plan_id FROM queries q
+            LEFT JOIN execution_plans ep ON ep.id=(
+                SELECT id FROM execution_plans WHERE query_id=q.id ORDER BY id DESC LIMIT 1
+            ) WHERE q.id=?
+        """, (query_id,)).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise HTTPException(404, "Requête introuvable")
+    return dict(row)
+
+
+def _oracle_connection(row=None):
+    settings = get_oracle_settings()
+    connection = connect_oracle(user=settings["oracle_user"], password=settings["oracle_password"],
+                                dsn=settings["oracle_dsn"])
+    try:
+        if row is not None:
+            assert_query_source(row, connection)
+        return connection
+    except Exception:
+        try:
+            connection.close()
+        except Exception:
+            _log.exception("Fermeture Oracle apres refus de source echouee")
+        raise
+
+
+async def _alert_loop(stop):
+    from db.alerts import evaluate_alerts
+    while not stop.is_set():
+        try:
+            await run_in_threadpool(evaluate_alerts)
+        except Exception:
+            _log.exception("Evaluation periodique des alertes echouee")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+
+
+@asynccontextmanager
+async def _lifespan(application):
+    stop = asyncio.Event()
+    task = asyncio.create_task(_alert_loop(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
 
 
 def _safe_json(obj) -> str:
@@ -41,7 +107,7 @@ def _safe_json(obj) -> str:
     raw = _re.sub(r'[\ud800-\udfff]', '\ufffd', raw)
     return raw
 
-app = FastAPI(title="OracleIQ", version="1.0.0")
+app = FastAPI(title="OracleIQ", version="1.0.0", lifespan=_lifespan)
 
 from api.security import (
     COOKIE_NAME as _COOKIE_NAME, COOKIE_TTL as _COOKIE_TTL,
@@ -58,14 +124,15 @@ class SettingsPatch(BaseModel):
     analyzer_ai_mode: Literal["native"] | None = None
     collector_active: bool | None = None
     ai_model: str | None = Field(default=None, min_length=1, max_length=200)
-    ai_max_tokens: int | None = Field(default=None, ge=256, le=64000)
-    plan_truncate: int | None = Field(default=None, ge=100, le=100000)
+    ai_max_tokens: int | None = Field(default=None, ge=256, le=32000)
+    plan_truncate: int | None = Field(default=None, ge=100, le=16000)
     oracle_dsn: str | None = Field(default=None, max_length=1000)
     oracle_user: str | None = Field(default=None, max_length=128)
     oracle_password: str | None = Field(default=None, max_length=1024)
     tools_enabled: str | None = Field(default=None, max_length=2000)
     gather_stats_enabled: bool | None = None
-    system_prompt: str | None = Field(default=None, max_length=50000)
+    ai_send_raw_values: bool | None = None
+    system_prompt: str | None = Field(default=None, max_length=20000)
 
 # Migration DB au démarrage
 from db.store import init_db as _init_db
@@ -138,6 +205,41 @@ def api_health(request: Request):
             "automatic_analysis": get_setting("analyzer_mode", "manual") == "auto"}
 
 
+@app.get("/api/alerts")
+def api_alerts(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+               include_acknowledged: bool = True):
+    from db.alerts import list_alerts
+    return list_alerts(limit=limit, offset=offset, include_acknowledged=include_acknowledged)
+
+
+@app.post("/api/alerts/{alert_id}/acknowledge")
+def api_acknowledge_alert(alert_id: int, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    from db.alerts import acknowledge_alert
+    if not acknowledge_alert(alert_id):
+        raise HTTPException(404, "Alerte introuvable")
+    return {"ok": True}
+
+
+@app.get("/api/queries/{query_id}/ai-preview")
+def api_ai_preview(query_id: int, request: Request):
+    if not _is_admin(request):
+        raise HTTPException(403, "Droits administrateur requis")
+    from analyzer.ai_analyzer import build_ai_preview
+    row = _query_row(query_id)
+    try:
+        preview = build_ai_preview(row)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    context = {key: preview[key] for key in ("prompt", "system", "tools") if key in preview}
+    return {**preview, "ai_send_raw_values": bool(preview.get("send_raw_values", False)),
+            "context": context, "scope": "initial_context", "plan_id": row.get("plan_id"),
+            "warnings": [*preview.get("warnings", []),
+                         "Apercu du contexte initial actuellement enregistre ; un rafraichissement du plan peut le modifier.",
+                         "Les futurs appels et resultats d'outils, ainsi que les reponses IA, ne sont pas inclus."]}
+
+
 @app.get("/api/stats")
 def api_stats():
     from db.store import get_query_stats
@@ -146,7 +248,8 @@ def api_stats():
     stats["collector_active"] = get_setting("collector_active", "true") == "true"
     # Merger les analyses en cours : bouton manuel (mémoire) + analyzer auto (DB)
     from db.store import analyzing_queue_get
-    all_analyzing = set(analyzing_ids) | set(analyzing_queue_get())
+    with _analysis_lock:
+        all_analyzing = set(analyzing_ids) | set(analyzing_queue_get())
     stats["analyzing_ids"] = list(all_analyzing)
     return stats
 
@@ -156,10 +259,15 @@ def delete_query(query_id: int, request: Request):
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Authentification requise")
     from db.store import analyzing_queue_get
-    if query_id in analyzing_queue_get():
-        raise HTTPException(409, "Une analyse est en cours pour cette requete")
     from db.store import delete_query_data
-    delete_query_data(query_id)
+    with _analysis_lock:
+        if query_id in analyzing_queue_get() or query_id in _chat_ids:
+            raise HTTPException(409, "Une analyse ou un chat est en cours pour cette requete")
+        try:
+            delete_query_data(query_id)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        _analysis_results.pop(query_id, None)
     return {"ok": True}
 
 
@@ -169,8 +277,6 @@ async def purge_queries(request: Request):
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Authentification requise")
     from db.store import analyzing_queue_get
-    if analyzing_queue_get():
-        raise HTTPException(409, "Attendez la fin des analyses avant de purger")
     try:
         body = await request.json()
     except Exception:
@@ -179,8 +285,15 @@ async def purge_queries(request: Request):
     if scope not in ("all", "analyzed", "analyses"):
         raise HTTPException(status_code=400, detail="scope invalide")
     from db.store import purge_data
-    counts = purge_data(scope)
-    analyzing_ids.clear()
+    with _analysis_lock:
+        if analyzing_queue_get() or _chat_ids:
+            raise HTTPException(409, "Attendez la fin des analyses et chats avant de purger")
+        try:
+            counts = purge_data(scope)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        analyzing_ids.clear()
+        _analysis_results.clear()
     return {"ok": True, **counts}
 
 
@@ -211,6 +324,8 @@ def refresh_model_catalog(request: Request):
         raise HTTPException(409, "Actualisation disponible pour GitHub Copilot uniquement.")
     try:
         models = _copilot_client.list_account_models()
+    except _copilot_client.CopilotAuthenticationError as error:
+        raise HTTPException(502, str(error)) from None
     except Exception:
         raise HTTPException(502, "Catalogue Copilot indisponible. Verifiez la connexion GitHub du serveur et reessayez.") from None
     catalog = {"models": models, "updated_at": time.time()}
@@ -275,19 +390,27 @@ def get_all_settings(request: Request):
     """Retourne tous les paramètres configurables."""
     if not _is_admin(request):
         raise HTTPException(403, "Droits administrateur requis")
+    values = get_settings({
+        "analyzer_mode": "manual", "collector_active": "true",
+        "ai_model": AI_MODEL, "ai_max_tokens": "8000", "plan_truncate": "16000",
+        "oracle_dsn": ORACLE_DSN, "oracle_user": ORACLE_USER, "oracle_password": ORACLE_PASSWORD,
+        "tools_enabled": "", "gather_stats_enabled": "false", "system_prompt": "",
+        "ai_send_raw_values": "false",
+    })
     return {
-        "analyzer_mode":    get_setting("analyzer_mode", "manual"),
+        "analyzer_mode":    values["analyzer_mode"],
         "analyzer_ai_mode": "native",
-        "collector_active": get_setting("collector_active", "true") == "true",
-        "ai_model":         get_setting("ai_model", "claude-sonnet-4.6"),
-        "ai_max_tokens":    int(get_setting("ai_max_tokens", "8000")),
-        "plan_truncate":    int(get_setting("plan_truncate", "3000")),
-        "oracle_dsn":       get_setting("oracle_dsn",  ORACLE_DSN),
-        "oracle_user":      get_setting("oracle_user", ORACLE_USER),
-        "oracle_has_pwd":   bool(get_setting("oracle_password", ORACLE_PASSWORD)),
-        "tools_enabled":    get_setting("tools_enabled", ""),   # CSV de tools activés, vide = tous
-        "gather_stats_enabled": get_setting("gather_stats_enabled", "false") == "true",
-        "system_prompt":    get_setting("system_prompt", ""),  # vide = prompt par défaut
+        "collector_active": values["collector_active"] == "true",
+        "ai_model":         values["ai_model"],
+        "ai_max_tokens":    int(values["ai_max_tokens"]),
+        "plan_truncate":    int(values["plan_truncate"]),
+        "oracle_dsn":       values["oracle_dsn"],
+        "oracle_user":      values["oracle_user"],
+        "oracle_has_pwd":   bool(values["oracle_password"]),
+        "tools_enabled":    values["tools_enabled"],
+        "gather_stats_enabled": values["gather_stats_enabled"] == "true",
+        "ai_send_raw_values": values["ai_send_raw_values"] == "true",
+        "system_prompt":    values["system_prompt"],
         # on ne retourne jamais le mot de passe
     }
 
@@ -298,13 +421,13 @@ async def save_all_settings(request: Request, settings: SettingsPatch):
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Authentification requise")
     body = settings.model_dump(exclude_unset=True, exclude_none=True)
-    saved = {}
+    values = {}
     for key, val in body.items():
         if isinstance(val, bool):
             val = "true" if val else "false"
-        set_setting(key, str(val))
-        if key != "oracle_password":
-            saved[key] = val
+        values[key] = str(val)
+    set_settings(values)
+    saved = {key: val for key, val in values.items() if key != "oracle_password"}
     return {"ok": True, "saved": saved}
 
 
@@ -336,40 +459,44 @@ async def test_oracle_connection(request: Request):
 
 
 def _test_oracle_connection(body):
-    dsn  = body.get("oracle_dsn")  or get_setting("oracle_dsn",  ORACLE_DSN)
-    user = body.get("oracle_user") or get_setting("oracle_user", ORACLE_USER)
+    settings = get_oracle_settings()
+    dsn  = body.get("oracle_dsn")  or settings["oracle_dsn"]
+    user = body.get("oracle_user") or settings["oracle_user"]
     pwd  = body.get("oracle_password")
     if not pwd:
-        pwd = get_setting("oracle_password", ORACLE_PASSWORD)
+        pwd = settings["oracle_password"]
     try:
         import oracledb
         c = connect_oracle(user=user, password=pwd, dsn=dsn)
-        v = c.version
-        c.close()
+        try:
+            v = c.version
+        finally:
+            c.close()
         return {"ok": True, "version": v, "dsn": dsn, "user": user}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception:
+        _log.exception("Test de connexion Oracle echoue")
+        return {"ok": False, "error": "Connexion Oracle impossible. Consultez les journaux."}
 
 
 @app.post("/api/repair_sql_texts")
 def repair_sql_texts():
     """Récupère le texte SQL complet pour toutes les requêtes tronquées (length=1000)."""
+    conn_ora = None
     try:
-        from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-        import oracledb
         from collector.oracle_collector import get_full_sql_text
-        _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-        _user = get_setting("oracle_user",     ORACLE_USER)
-        _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-        if not _dsn or not _user or not _pwd:
-            raise ValueError("Connexion Oracle non configurée")
-        conn_ora = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-
         conn_sqlite = get_conn()
-        rows = conn_sqlite.execute(
-            "SELECT id, sql_id, length(sql_text) as l FROM queries WHERE length(sql_text) >= 999"
-        ).fetchall()
-        conn_sqlite.close()
+        try:
+            rows = conn_sqlite.execute(
+                "SELECT *, length(sql_text) as l FROM queries WHERE length(sql_text) >= 999"
+            ).fetchall()
+        finally:
+            conn_sqlite.close()
+        if not rows:
+            return {"ok": True, "total": 0, "fixed": 0, "failed": 0}
+        conn_ora = _oracle_connection()
+        # Validate the entire batch before enriching even one historical row.
+        for row in rows:
+            assert_query_source(dict(row), conn_ora)
 
         fixed = 0
         failed = 0
@@ -379,439 +506,246 @@ def repair_sql_texts():
                 full = get_full_sql_text(conn_ora, sql_id)
                 if full and len(full) > cur_len:
                     conn_fix = get_conn()
-                    conn_fix.execute("UPDATE queries SET sql_text=? WHERE id=?", (full, qid))
-                    conn_fix.commit()
-                    conn_fix.close()
+                    try:
+                        with conn_fix:
+                            conn_fix.execute("UPDATE queries SET sql_text=? WHERE id=?", (full, qid))
+                    finally:
+                        conn_fix.close()
                     fixed += 1
             except Exception:
+                _log.exception("Reparation SQL echouee pour %s", qid)
                 failed += 1
-
-        conn_ora.close()
-        return {"ok": True, "total": len(rows), "fixed": fixed, "failed": failed}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": failed == 0, "total": len(rows), "fixed": fixed, "failed": failed}
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except Exception:
+        _log.exception("Reparation des textes SQL echouee")
+        return {"ok": False, "error": "Reparation Oracle indisponible."}
+    finally:
+        if conn_ora is not None:
+            conn_ora.close()
 
 
 @app.post("/api/refresh_plan/{query_id}")
 def refresh_plan_endpoint(query_id: int):
     """Rafraîchit le plan d’exécution Oracle pour une requête donnée."""
-    conn = get_conn()
-    q = conn.execute("SELECT id, sql_id, child_number FROM queries WHERE id=?", (query_id,)).fetchone()
-    conn.close()
-    if not q:
-        raise HTTPException(404, "Requête introuvable")
+    q = _query_row(query_id)
+    conn_ora = None
     try:
-        from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-        import oracledb
         from collector.oracle_collector import get_execution_plan
-        _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-        _user = get_setting("oracle_user",     ORACLE_USER)
-        _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-        if not _dsn or not _user or not _pwd:
-            raise ValueError("Connexion Oracle non configurée")
-        conn_ora = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-        sql_id = dict(q)["sql_id"]
-        plan = get_execution_plan(conn_ora, sql_id, dict(q).get("child_number", 0))
-        conn_ora.close()
-        if plan and 'non disponible' not in plan.lower():
+        conn_ora = _oracle_connection(q)
+        plan = get_execution_plan(conn_ora, q["sql_id"], q.get("child_number", 0))
+        if is_execution_plan_available(plan):
             from db.store import save_plan
             save_plan(query_id, plan)
             return {"ok": True, "plan": plan}
         return {"ok": False, "error": "Plan non disponible depuis Oracle"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except Exception:
+        _log.exception("Rafraichissement du plan echoue pour %s", query_id)
+        return {"ok": False, "error": "Plan Oracle indisponible."}
+    finally:
+        if conn_ora is not None:
+            conn_ora.close()
 
 
 @app.post("/api/analyze/{query_id:int}")
 async def analyze_query_endpoint(query_id: int, request: Request):
-    """Lance l'analyse IA. refresh_plan=true récupère un nouveau plan Oracle avant d'analyser."""
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-    refresh_plan = True  # toujours rafraîchir le plan Oracle avant d'analyser
+    _query_row(query_id)
+    started = _start_analysis(query_id)
+    return {"ok": True, "query_id": query_id,
+            "status": "analyzing" if started else "already_analyzing", "refresh_plan": True}
 
-    # Garde anti-doublon : ne pas relancer si déjà en cours
-    if query_id in analyzing_ids:
-        return {"ok": True, "query_id": query_id, "status": "already_analyzing"}
 
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM queries WHERE id=?", (query_id,)).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "Requête introuvable")
+def _publish(query_id: int, event: dict):
+    with _analysis_lock:
+        for subscriber in _stream_queues.get(query_id, []):
+            if subscriber.full():
+                try:
+                    subscriber.get_nowait()
+                except _queue_mod.Empty:
+                    pass
+            subscriber.put_nowait(event)
 
-    from db.store import analyzing_queue_add, analyzing_queue_remove, save_analysis_error
-    try:
-        if not analyzing_queue_add(query_id):
-            return {"ok": True, "query_id": query_id, "status": "already_analyzing"}
-    except ValueError as error:
-        raise HTTPException(429, str(error)) from error
-    analyzing_ids.add(query_id)
 
-    def _run_sync():
-        conn_ora = None
+def _finish_analysis(query_id: int, event: dict):
+    from db.store import analyzing_queue_remove
+    with _analysis_lock:
         try:
-            from db.store import get_conn as gc, save_analysis, save_plan
-            from analyzer.ai_analyzer import analyze_query as _analyze_query
-            import logging
-            log = logging.getLogger("oracleiq")
-
-            conn2 = gc()
-            q = conn2.execute("""
-                SELECT q.*, ep.plan_text FROM queries q
-                LEFT JOIN execution_plans ep ON ep.id=(
-                    SELECT id FROM execution_plans WHERE query_id=q.id ORDER BY id DESC LIMIT 1
-                )
-                WHERE q.id=?
-            """, (query_id,)).fetchone()
-            conn2.close()
-            if not q:
-                log.error(f"Analyze {query_id}: query not found")
-                return
-            q = dict(q)
-
-            # Connexion Oracle (pour refresh plan + outils agentiques)
-            plan_text = q.get('plan_text') or 'N/A'
-            try:
-                from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-                import oracledb
-                _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-                _user = get_setting("oracle_user",     ORACLE_USER)
-                _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-                conn_ora = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-                log.info(f"Analyze {query_id}: Oracle connected")
-
-                # Rafraîchir le plan
-                if refresh_plan:
-                    from collector.oracle_collector import get_execution_plan
-                    db2 = gc()
-                    sql_id_row = db2.execute('SELECT sql_id FROM queries WHERE id=?', (query_id,)).fetchone()
-                    db2.close()
-                    sql_id = sql_id_row[0] if sql_id_row else ''
-                    new_plan = get_execution_plan(conn_ora, sql_id, q.get("child_number", 0))
-                    if new_plan and 'non disponible' not in new_plan.lower():
-                        save_plan(query_id, new_plan)
-                        plan_text = new_plan
-                        log.info(f"Analyze {query_id}: plan refreshed ({len(new_plan)} chars)")
-            except Exception as pe:
-                log.warning(f"Analyze {query_id}: Oracle connect/plan failed: {pe}")
-                conn_ora = None
-
-            # Tronquer le plan
-            plan_truncate  = int(get_setting("plan_truncate", "3000"))
-            q['plan_text'] = plan_text[:plan_truncate] + ('\n[plan tronqué...]' if len(plan_text) > plan_truncate else '')
-
-            # Analyse agentique (avec connexion Oracle si disponible)
-            ai_model = get_setting("ai_model", "claude-sonnet-4.6")
-            log.info(f"Analyze {query_id}: starting native analysis, oracle={'yes' if conn_ora else 'no'}")
-            result = _analyze_query(q, oracle_conn=conn_ora)
-            log.info(f"Analyze {query_id}: done score={result['score']} severity={result['severity']} usage={result['usage']}")
-            save_analysis(query_id, {**result, "model": ai_model})
-        except Exception as e:
-            import logging, traceback
-            save_analysis_error(query_id, "Analyse echouee. Consultez les journaux puis relancez.")
-            tb = traceback.format_exc()
-            logging.getLogger("oracleiq").error(f"Analyze {query_id} failed: {e}\n{tb}")
-            with open("/tmp/oracleiq_analyze_err.log", "a") as _ef:
-                _ef.write(f"=== Analyze {query_id} FAILED ===\n{tb}\n")
-            print(f"[ANALYZE ERROR] {query_id}: {e}", flush=True)
-        finally:
-            if conn_ora:
-                try: conn_ora.close()
-                except Exception: pass
-            analyzing_ids.discard(query_id)
             analyzing_queue_remove(query_id)
+        except Exception:
+            _log.exception("Liberation de reservation echouee pour %s", query_id)
+        analyzing_ids.discard(query_id)
+        _analysis_results[query_id] = (time.monotonic(), event)
+        for old_id, (finished, _) in list(_analysis_results.items()):
+            if time.monotonic() - finished > _STREAM_TIMEOUT:
+                _analysis_results.pop(old_id, None)
+        _publish(query_id, event)
+        _stream_queues.pop(query_id, None)
 
-    _analysis_executor.submit(_run_sync)
-    return {"ok": True, "query_id": query_id, "status": "analyzing", "refresh_plan": refresh_plan}
+
+def _analysis_event(query_id: int, event: dict):
+    kind = event.get("type")
+    if kind == "thinking":
+        event = {"type": "status", "message": "IA en cours d'analyse"}
+    elif kind == "tool_start":
+        event = {"type": "tool_call", "name": event["tool"], "args": event.get("args", {})}
+    elif kind == "tool_result":
+        event = {"type": "tool_result", "name": event["tool"],
+                 "preview": _safe_json(event.get("result", {}))[:200],
+                 "ok": event.get("ok", False), "ms": event.get("ms", 0)}
+    elif kind == "complete":
+        event = {"type": "analysis", "content": event["result"].get("raw", "")}
+    _publish(query_id, event)
+
+
+def _run_analysis(query_id: int):
+    connection = None
+    row = None
+    stale_result = False
+    terminal = {"type": "error", "message": "Analyse echouee. Consultez les journaux."}
+    try:
+        from db.store import save_analysis, save_plan
+        from analyzer.ai_analyzer import analyze_query
+        row = _query_row(query_id)
+        terminal["plan_id"] = row.get("plan_id")
+        try:
+            connection = _oracle_connection(row)
+        except ValueError:
+            # Identity failures must never silently become offline analyses.
+            raise
+        except Exception:
+            _log.warning("Oracle indisponible pour l'analyse %s", query_id, exc_info=True)
+            _publish(query_id, {"type": "status", "message": "Oracle indisponible : contexte local uniquement."})
+        if connection is not None:
+            from collector.oracle_collector import get_execution_plan
+            new_plan = get_execution_plan(connection, row["sql_id"], row.get("child_number", 0))
+            if is_execution_plan_available(new_plan):
+                save_plan(query_id, new_plan)
+                row = _query_row(query_id)
+                terminal["plan_id"] = row.get("plan_id")
+                _publish(query_id, {"type": "status", "message": "Plan Oracle rafraichi"})
+        result = analyze_query(row, oracle_conn=connection,
+                               on_event=lambda event: _analysis_event(query_id, event))
+        saved = save_analysis(query_id, result, expected_plan_id=row.get("plan_id"))
+        current = _query_row(query_id)
+        if saved is False or current.get("plan_id") != row.get("plan_id") or not current.get("analyzed"):
+            stale_result = True
+            raise ValueError("Le plan a change pendant l'analyse. Relancez sur la version courante.")
+        terminal = {"type": "done", "score": result["score"], "severity": result["severity"],
+                    "plan_id": row.get("plan_id")}
+    except Exception as error:
+        _log.exception("Analyse echouee pour %s", query_id)
+        if isinstance(error, ValueError):
+            terminal["message"] = str(error)
+        try:
+            from db.store import save_analysis_error
+            if row is not None and not stale_result:
+                save_analysis_error(query_id, terminal["message"], expected_plan_id=row.get("plan_id"))
+        except Exception:
+            _log.exception("Enregistrement d'erreur d'analyse echoue pour %s", query_id)
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        except Exception:
+            _log.exception("Fermeture Oracle echouee pour %s", query_id)
+        finally:
+            _finish_analysis(query_id, terminal)
+
+
+def _start_analysis(query_id: int) -> bool:
+    from db.store import analyzing_queue_add
+    with _analysis_lock:
+        if query_id in analyzing_ids:
+            return False
+        try:
+            if not analyzing_queue_add(query_id):
+                return False
+        except ValueError as error:
+            _query_row(query_id)
+            raise HTTPException(429, str(error)) from error
+        analyzing_ids.add(query_id)
+        _analysis_results.pop(query_id, None)
+        try:
+            _analysis_executor.submit(_run_analysis, query_id)
+        except Exception as error:
+            _finish_analysis(query_id, {"type": "error", "message": "Service d'analyse indisponible."})
+            raise HTTPException(503, "Service d'analyse indisponible.") from error
+        return True
 
 
 @app.get("/api/analyze/{query_id}/stream")
 async def analyze_query_stream(query_id: int, request: Request):
-    """
-    SSE endpoint — analyse native en streaming.
-    Émet des événements : tool_call, tool_result, text, done, error.
-    Uniquement disponible en mode native.
-    """
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM queries WHERE id=?", (query_id,)).fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(404, "Requête introuvable")
-
-    if query_id in analyzing_ids:
-        # Analyse déjà en cours — brancher sur la queue existante
-        sub_queue: _queue_mod.Queue = _queue_mod.Queue()
-        _stream_queues.setdefault(query_id, []).append(sub_queue)
-        sub_queue.put({"type": "status", "message": "\ud83d\udd04 Reconnexion au stream en cours..."})
-
-        async def _resume_generator():
+    """Start or subscribe to the same job used by POST and bulk analyses."""
+    from db.store import analyzing_queue_get
+    row = _query_row(query_id)
+    initial_analysis = get_query_detail(query_id).get("analysis")
+    initial_analysis_id = initial_analysis["id"] if initial_analysis else None
+    subscriber = _queue_mod.Queue(maxsize=128)
+    external = False
+    with _analysis_lock:
+        terminal = _analysis_results.get(query_id)
+        if (terminal and time.monotonic() - terminal[0] < 30
+                and terminal[1].get("plan_id") == row.get("plan_id")):
+            subscriber.put(terminal[1])
+        else:
+            _stream_queues.setdefault(query_id, []).append(subscriber)
             try:
-                while True:
-                    try:
-                        evt = await asyncio.get_event_loop().run_in_executor(None, sub_queue.get, True, 1.0)
-                    except _queue_mod.Empty:
-                        yield ": keepalive\n\n"
-                        continue
-                    if evt is None:
-                        break
-                    yield "data: " + json.dumps(evt, default=str, ensure_ascii=True) + "\n\n"
-            finally:
-                # Nettoyer l'abonnement
-                try:
-                    _stream_queues.get(query_id, []).remove(sub_queue)
-                except ValueError:
-                    pass
+                if query_id not in analyzing_ids:
+                    external = not _start_analysis(query_id)
+            except Exception:
+                subscribers = _stream_queues.get(query_id, [])
+                if subscriber in subscribers:
+                    subscribers.remove(subscriber)
+                if not subscribers:
+                    _stream_queues.pop(query_id, None)
+                raise
 
-        return StreamingResponse(
-            _resume_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    from db.store import analyzing_queue_add, analyzing_queue_remove, save_analysis_error
-    try:
-        if not analyzing_queue_add(query_id):
-            raise HTTPException(409, "Analyse deja reservee par un autre traitement")
-    except ValueError as error:
-        raise HTTPException(429, str(error)) from error
-    analyzing_ids.add(query_id)
-    evt_queue: _queue_mod.Queue = _queue_mod.Queue()
-    _stream_queues[query_id] = []  # liste des abonnés secondaires
-
-    def _broadcast(evt: dict):
-        """Envoie l'événement à la queue principale + tous les abonnés (reconnexions)."""
-        evt_queue.put(evt)
-        for sub in list(_stream_queues.get(query_id, [])):
-            sub.put(evt)
-
-    def _run_stream():
-        conn_ora = None
+    async def events():
+        deadline = time.monotonic() + _STREAM_TIMEOUT
         try:
-            from db.store import get_conn as gc, save_analysis, save_plan
-            from analyzer.ai_analyzer import _build_initial_prompt, parse_ai_response
-            from analyzer.copilot_client import chat_with_tools
-            import logging
-            log = logging.getLogger("oracleiq")
-
-            conn2 = gc()
-            q = conn2.execute("""
-                SELECT q.*, ep.plan_text FROM queries q
-                LEFT JOIN execution_plans ep ON ep.id=(
-                    SELECT id FROM execution_plans WHERE query_id=q.id ORDER BY id DESC LIMIT 1
-                )
-                WHERE q.id=?
-            """, (query_id,)).fetchone()
-            conn2.close()
-            if not q:
-                _broadcast({"type": "error", "message": "Requête introuvable"})
-                return
-            q = dict(q)
-
-            # Connexion Oracle
-            try:
-                from config import ORACLE_DSN, ORACLE_USER, ORACLE_PASSWORD
-                import oracledb
-                _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-                _user = get_setting("oracle_user",     ORACLE_USER)
-                _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-                conn_ora = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-                _broadcast({"type": "status", "message": "✅ Oracle connecté"})
-
-                # Refresh plan
-                from collector.oracle_collector import get_execution_plan
-                db2 = gc()
-                sql_id_row = db2.execute('SELECT sql_id FROM queries WHERE id=?', (query_id,)).fetchone()
-                db2.close()
-                sql_id = sql_id_row[0] if sql_id_row else ''
-                new_plan = get_execution_plan(conn_ora, sql_id, q.get("child_number", 0))
-                if new_plan and 'non disponible' not in new_plan.lower():
-                    save_plan(query_id, new_plan)
-                    q['plan_text'] = new_plan
-                    _broadcast({"type": "status", "message": "📄 Plan Oracle rafraîci"})
-            except Exception as pe:
-                log.warning(f"Stream {query_id}: Oracle connect/plan: {pe}")
-                conn_ora = None
-                _broadcast({"type": "status", "message": "⚠️ Oracle non disponible"})
-
-            # Tronquer le plan
-            plan_truncate = int(get_setting("plan_truncate", "3000"))
-            pt = q.get('plan_text') or 'N/A'
-            q['plan_text'] = pt[:plan_truncate] + ('\n[plan tronqué...]' if len(pt) > plan_truncate else '')
-
-            # Boucle native avec SSE
-            model_used = get_setting("ai_model", "claude-sonnet-4.6")
-            from analyzer.oracle_tools import get_tools_schema_filtered, execute_tool_native, SYSTEM_NATIVE_ANALYZE
-            from analyzer.ai_analyzer import _get_max_tokens
-            tools_schema = get_tools_schema_filtered()
-            system_native = get_setting("system_prompt", "").strip() or SYSTEM_NATIVE_ANALYZE
-            max_tokens = _get_max_tokens()
-
-            messages = [{"role": "user", "content": _build_initial_prompt(q)}]
-            total_usage: dict = {}
-            all_parts: list[str] = []
-            trace: list[dict] = []
-            MAX_TOOL_CALLS = 30
-            tool_calls_count = 0
-
-            while True:
-                _broadcast({"type": "status", "message": "🤔 IA réfléchit..."})
-                text, tool_calls, usage = chat_with_tools(
-                    messages=messages, tools=tools_schema,
-                    model=model_used, max_tokens=max_tokens, system=system_native,
-                )
-                for k, v in (usage or {}).items():
-                    if isinstance(v, (int, float)):
-                        total_usage[k] = total_usage.get(k, 0) + v
-
-                if text:
-                    all_parts.append(text)
-
-                if not tool_calls:
-                    # Vérifier que le texte contient bien une analyse finale (SCORE: requis)
-                    has_score = text and ("SCORE:" in text or "score:" in text.lower())
-                    if not has_score and len(all_parts) <= 3:
-                        # Le modèle a répondu sans tool_calls ni analyse finale (texte préliminaire)
-                        # Forcer tool_choice=required pour qu'il appelle un outil
-                        _broadcast({"type": "status", "message": "🔄 Réponse incomplète, forcçage des outils..."})
-                        messages.append({"role": "assistant", "content": text or ""})
-                        messages.append({"role": "user", "content": "Tu dois appeler au moins un outil Oracle pour collecter les informations nécessaires avant de rédiger l'analyse."})
-                        _broadcast({"type": "status", "message": "🤔 IA réfléchit..."})
-                        text, tool_calls, usage = chat_with_tools(
-                            messages=messages, tools=tools_schema,
-                            model=model_used, max_tokens=max_tokens, system=system_native,
-                            tool_choice="required",
-                        )
-                        for k, v in (usage or {}).items():
-                            if isinstance(v, (int, float)):
-                                total_usage[k] = total_usage.get(k, 0) + v
-                        if text:
-                            all_parts.append(text)
-                        if not tool_calls:
-                            # Toujours rien — forcer conclusion directement
-                            _broadcast({"type": "status", "message": "⚠️ Pas d'outils disponibles, conclusion forcée"})
-                            messages.append({"role": "assistant", "content": text or ""})
-                            messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale avec SCORE: / SEVERITY: / SUMMARY: basée sur le SQL et le plan d'exécution fournis."})
-                            text3, _, usage3 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=max_tokens, system=system_native)
-                            if text3:
-                                all_parts.append(text3)
-                                _broadcast({"type": "analysis", "content": text3})
-                            for k, v in (usage3 or {}).items():
-                                if isinstance(v, (int, float)):
-                                    total_usage[k] = total_usage.get(k, 0) + v
-                            break
-                        # tool_calls disponibles — on continue la boucle normalement
+            while time.monotonic() < deadline:
+                if await request.is_disconnected():
+                    return
+                try:
+                    event = subscriber.get_nowait()
+                except _queue_mod.Empty:
+                    if external and query_id not in await run_in_threadpool(analyzing_queue_get):
+                        detail = await run_in_threadpool(get_query_detail, query_id)
+                        analysis = detail.get("analysis")
+                        current = detail.get("query") or {}
+                        if current.get("analysis_error"):
+                            event = {"type": "error", "message": "Analyse automatique echouee. Consultez les journaux."}
+                        elif (analysis and analysis["id"] != initial_analysis_id
+                              and current.get("analyzed")
+                              and analysis.get("plan_id") == (detail.get("plan") or {}).get("id")):
+                            event = {"type": "done", "score": analysis["perf_score"],
+                                     "severity": analysis["severity"]}
+                        else:
+                            event = {"type": "error", "message": "Analyse terminee sans nouveau resultat valide."}
                     else:
-                        # Analyse finale réelle
-                        _broadcast({"type": "analysis", "content": text or ""})
-                        break
-
-                # Émettre chaque tool call + son résultat
-                if tool_calls_count + len(tool_calls) > MAX_TOOL_CALLS:
-                    _broadcast({"type": "status", "message": "⚠️ Limite d'appels atteinte, conclusion forcée"})
-                    if tool_calls:
-                        messages.append({
-                            "role": "assistant", "content": text,
-                            "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])}} for tc in tool_calls]
-                        })
-                        for tc in tool_calls:
-                            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps({"error": "Limite atteinte."})})
-                    messages.append({"role": "user", "content": "Rédige MAINTENANT l'analyse finale avec SCORE: / SEVERITY: / SUMMARY:"})
-                    text2, _, usage2 = chat_with_tools(messages=messages, tools=[], model=model_used, max_tokens=max_tokens, system=system_native)
-                    if text2:
-                        all_parts.append(text2)
-                        _broadcast({"type": "analysis", "content": text2})
-                    for k, v in (usage2 or {}).items():
-                        if isinstance(v, (int, float)):
-                            total_usage[k] = total_usage.get(k, 0) + v
-                    break
-
-                assistant_msg = {
-                    "role": "assistant", "content": text,
-                    "tool_calls": [{"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])}} for tc in tool_calls]
-                }
-                messages.append(assistant_msg)
-
-                for tc in tool_calls:
-                    tool_calls_count += 1
-                    tool_name = tc["name"]
-                    tool_args = tc["arguments"]
-                    _broadcast({"type": "tool_call", "name": tool_name, "args": tool_args})
-                    import time as _time
-                    t0 = _time.monotonic()
-                    if conn_ora:
-                        result = execute_tool_native(conn_ora, tool_name, tool_args)
-                    else:
-                        result = {"error": "Oracle non disponible"}
-                    elapsed_ms = int((_time.monotonic() - t0) * 1000)
-                    has_error = "error" in result
-                    trace.append({
-                        "t": _time.strftime("%H:%M:%S"),
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "ok": not has_error,
-                        "error": result.get("error") if has_error else None,
-                        "ms": elapsed_ms,
-                    })
-                    # N'envoyer que le résumé du résultat (pas tout le JSON brut)
-                    result_preview = str(result)[:200] + ("..." if len(str(result)) > 200 else "")
-                    _broadcast({"type": "tool_result", "name": tool_name, "preview": result_preview, "ok": not has_error, "ms": elapsed_ms})
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _safe_json(result)})
-
-            # Sauvegarder l'analyse
-            final_raw = all_parts[-1] if all_parts else ""
-            full_raw = "\n\n---\n\n".join(all_parts)
-            from analyzer.ai_analyzer import parse_ai_response
-            parsed = parse_ai_response(final_raw)
-            ai_model = get_setting("ai_model", "claude-sonnet-4.6")
-            save_analysis(query_id, {
-                "model": ai_model, "score": parsed.get("score", 50),
-                "severity": parsed.get("severity", "warning"),
-                "summary": parsed.get("summary", ""),
-                "issues": parsed.get("issues", []),
-                "recommendations": parsed.get("recommendations", []),
-                "raw": full_raw, "usage": total_usage, "trace": trace,
-            })
-            _broadcast({"type": "done", "score": parsed.get("score", 50), "severity": parsed.get("severity", "warning")})
-
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            log.error(f"Stream {query_id} failed: {e}\n{tb}")
-            save_analysis_error(query_id, "Analyse echouee. Consultez les journaux puis relancez.")
-            _broadcast({"type": "error", "message": "Analyse echouee. Consultez les journaux."})
+                        yield ": keepalive\n\n"
+                        await asyncio.sleep(0.2)
+                        continue
+                yield "data: " + _safe_json(event) + "\n\n"
+                if event["type"] in {"done", "error"}:
+                    return
+            yield "data: " + _safe_json({"type": "error", "message": "Delai d'attente depasse. Reconnectez-vous pour suivre l'analyse."}) + "\n\n"
+        except Exception:
+            _log.exception("Suivi d'analyse echoue pour %s", query_id)
+            yield "data: " + _safe_json({"type": "error", "message": "Suivi d'analyse indisponible. Reconnectez-vous."}) + "\n\n"
         finally:
-            if conn_ora:
-                try: conn_ora.close()
-                except: pass
-            analyzing_ids.discard(query_id)
-            analyzing_queue_remove(query_id)
-            # Envoyer le sentinel à tous les abonnés secondaires
-            for sub in list(_stream_queues.pop(query_id, [])):
-                sub.put(None)
-            evt_queue.put(None)  # sentinel principal
+            with _analysis_lock:
+                subscribers = _stream_queues.get(query_id, [])
+                if subscriber in subscribers:
+                    subscribers.remove(subscriber)
+                if not subscribers:
+                    _stream_queues.pop(query_id, None)
 
-    _analysis_executor.submit(_run_stream)
-
-    async def _event_generator():
-        while True:
-            # Polling non-bloquant sur la queue
-            try:
-                evt = await asyncio.get_event_loop().run_in_executor(None, evt_queue.get, True, 1.0)
-            except _queue_mod.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if evt is None:
-                break
-            yield "data: " + _safe_json(evt) + "\n\n"
-
-    return StreamingResponse(
-        _event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/queries/{query_id}/performance")
@@ -872,7 +806,7 @@ def refresh_bind_captures(query_id: int):
 def _get_bind_captures(query_id: int, refresh: bool = False):
     from db.store import get_conn as sqlite_conn, get_bind_values
     sconn = sqlite_conn()
-    row = sconn.execute("SELECT sql_id FROM queries WHERE id=?", (query_id,)).fetchone()
+    row = sconn.execute("SELECT * FROM queries WHERE id=?", (query_id,)).fetchone()
     sconn.close()
     if not row or not row["sql_id"]:
         raise HTTPException(404, "sql_id introuvable")
@@ -904,16 +838,15 @@ def _get_bind_captures(query_id: int, refresh: bool = False):
         return {"sql_id": sql_id, "captured": False, "source": "sqlite", "binds": [],
                 "message": "Aucune valeur de bind capturee dans l'historique local."}
 
+    child_number = row["child_number"]
+    if not isinstance(child_number, int) or child_number < 0:
+        raise HTTPException(409, "Identite du curseur enfant inconnue ; rafraichissement des binds refuse.")
     oconn = None
     try:
-        import oracledb
-        _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-        _user = get_setting("oracle_user",     ORACLE_USER)
-        _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-        oconn = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
+        oconn = _oracle_connection(dict(row))
         from analyzer.oracle_tools import bind_captures
         from db.store import save_bind_values
-        result = bind_captures(oconn, sql_id)
+        result = bind_captures(oconn, sql_id, child_number=child_number)
         # Stocker en SQLite pour les prochaines consultations
         if result.get("captured") and result.get("binds"):
             save_bind_values(query_id, [
@@ -924,7 +857,10 @@ def _get_bind_captures(query_id: int, refresh: bool = False):
             ])
             result["source"] = "oracle-live"
         return result
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
     except Exception:
+        _log.exception("Rafraichissement des binds echoue pour %s", query_id)
         return {
             "sql_id":   sql_id,
             "captured": False,
@@ -948,6 +884,15 @@ CHAT_SYSTEM = SYSTEM_NATIVE_CHAT
 # Replay SQL
 # ─────────────────────────────────────────────
 
+def _has_replay_binds(sql_text: str) -> bool:
+    import re
+    from analyzer.data_policy import mask_sql
+    masked = mask_sql(sql_text, mask_numbers=False)
+    # The shared lexer removes literals/comments; skip quoted identifiers as units.
+    tokens = re.finditer(r'"(?:[^"]|"")*(?:"|$)|(:[A-Za-z_0-9"])', masked)
+    return any(token.group(1) is not None for token in tokens)
+
+
 @app.post("/api/queries/{query_id}/replay")
 def replay_query(query_id: int):
     """
@@ -964,7 +909,7 @@ def replay_query(query_id: int):
 
     sconn = get_conn()
     row = sconn.execute(
-        "SELECT id, sql_text, sql_id FROM queries WHERE id=?", (query_id,)
+        "SELECT * FROM queries WHERE id=?", (query_id,)
     ).fetchone()
     sconn.close()
     if not row:
@@ -984,27 +929,60 @@ def replay_query(query_id: int):
         return {"ok": False, "error": "Seules les requêtes SELECT peuvent être rejouées."}
     if _FORBIDDEN.search(sql_text):
         return {"ok": False, "error": "Requête refusée : contient des mots-clés non autorisés."}
+    if _has_replay_binds(sql_text):
+        return {"ok": False, "error": "Rejeu des requetes bindees non pris en charge : valeurs de binds explicites requises."}
+    parsing_schema = row["schema_name"]
+    if not isinstance(parsing_schema, str) or not parsing_schema.strip() or parsing_schema == "UNKNOWN":
+        return {"ok": False, "error": "Rejeu refuse : schema de parsing historique inconnu."}
 
     try:
-        _dsn  = get_setting("oracle_dsn",      ORACLE_DSN)
-        _user = get_setting("oracle_user",     ORACLE_USER)
-        _pwd  = get_setting("oracle_password", ORACLE_PASSWORD)
-        oconn = connect_oracle(user=_user, password=_pwd, dsn=_dsn)
-    except Exception as e:
-        return {"ok": False, "error": f"Connexion Oracle impossible : {e}"}
+        oconn = _oracle_connection(dict(row))
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except Exception:
+        _log.exception("Connexion de rejeu echouee pour %s", query_id)
+        return {"ok": False, "error": "Connexion Oracle impossible."}
+
+    schema_cursor = None
+    schema_verified = False
+    try:
+        schema_cursor = oconn.cursor()
+        schema_cursor.execute("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM dual")
+        schema_row = schema_cursor.fetchone()
+        schema_verified = bool(schema_row and schema_row[0] == parsing_schema)
+        if not schema_verified:
+            return {"ok": False, "error": "Rejeu refuse : le schema Oracle courant differe du schema de parsing collecte. Aucun SQL rejoue."}
+    except Exception:
+        _log.exception("Verification du schema de rejeu echouee pour %s", query_id)
+        return {"ok": False, "error": "Rejeu refuse : schema Oracle courant impossible a verifier."}
+    finally:
+        if schema_cursor is not None:
+            try:
+                schema_cursor.close()
+            except Exception:
+                _log.exception("Fermeture du curseur de schema echouee pour %s", query_id)
+        if not schema_verified:
+            try:
+                oconn.close()
+            except Exception:
+                _log.exception("Fermeture Oracle apres refus du rejeu echouee pour %s", query_id)
 
     result = {"ok": True, "query_id": query_id}
+    cursors = []
+    statement_id = "ODIN_" + __import__("uuid").uuid4().hex[:24]
 
     # 1. EXPLAIN PLAN pour obtenir le plan sans les stats ALLSTATS (SQL non exécuté)
     try:
         cur = oconn.cursor()
-        cur.execute(f"EXPLAIN PLAN SET STATEMENT_ID='ODIN_REPLAY_{query_id}' FOR {sql_text}")
+        cursors.append(cur)
+        cur.execute(f"EXPLAIN PLAN SET STATEMENT_ID='{statement_id}' FOR {sql_text}")
         cur2 = oconn.cursor()
+        cursors.append(cur2)
         cur2.execute("""
             SELECT * FROM TABLE(
-                DBMS_XPLAN.DISPLAY('PLAN_TABLE', 'ODIN_REPLAY_{qid}', 'ALL')
+                DBMS_XPLAN.DISPLAY('PLAN_TABLE', :statement_id, 'ALL')
             )
-        """.replace("{qid}", str(query_id)))
+        """, statement_id=statement_id)
         plan_lines = []
         for r in cur2.fetchall():
             v = r[0]
@@ -1013,19 +991,24 @@ def replay_query(query_id: int):
         result["plan_text"] = "\n".join(plan_lines) if plan_lines else "[Plan non disponible]"
         # Nettoyage de la plan table
         try:
-            oconn.cursor().execute(
-                f"DELETE FROM plan_table WHERE statement_id='ODIN_REPLAY_{query_id}'"
-            )
+            cur.execute("DELETE FROM plan_table WHERE statement_id=:statement_id",
+                        statement_id=statement_id)
             oconn.commit()
         except Exception:
-            pass
-    except Exception as e:
-        result["plan_text"] = f"[EXPLAIN PLAN non disponible : {e}]"
+            _log.exception("Nettoyage PLAN_TABLE echoue pour %s", query_id)
+            result["ok"] = False
+            result["error"] = "Nettoyage du plan de rejeu echoue."
+    except Exception:
+        _log.exception("EXPLAIN PLAN de rejeu echoue pour %s", query_id)
+        result["ok"] = False
+        result["plan_text"] = "[EXPLAIN PLAN non disponible]"
+        result["error"] = "Generation du plan de rejeu echouee."
 
     # 2. Exécution réelle avec ROWNUM <= 5 pour mesurer le temps
     try:
         wrapped = f"SELECT * FROM ({sql_text}) WHERE ROWNUM <= 5"
         cur3 = oconn.cursor()
+        cursors.append(cur3)
         t0 = _time.perf_counter()
         cur3.execute(wrapped)
         rows = cur3.fetchall()
@@ -1039,12 +1022,19 @@ def replay_query(query_id: int):
             for r in rows
         ]
         result["note"] = "Exécution réelle (max 5 lignes) — temps mesuré côté serveur."
-    except Exception as e:
+    except Exception:
+        _log.exception("Execution de rejeu echouee pour %s", query_id)
+        result["ok"] = False
         result["elapsed_ms"]   = None
         result["rows_returned"] = None
-        result["exec_error"]   = str(e)
-
-    oconn.close()
+        result["exec_error"] = "Execution Oracle echouee."
+    finally:
+        for cursor in cursors:
+            try:
+                cursor.close()
+            except Exception:
+                _log.exception("Fermeture du curseur de rejeu echouee")
+        oconn.close()
     return result
 
 
@@ -1059,7 +1049,10 @@ def clear_chat(query_id: int, request: Request):
     if not _is_admin(request):
         raise HTTPException(status_code=403, detail="Authentification requise")
     from db.store import chat_clear
-    chat_clear(query_id)
+    with _analysis_lock:
+        if query_id in _chat_ids:
+            raise HTTPException(409, "Une reponse de chat est en cours.")
+        chat_clear(query_id)
     return {"ok": True}
 
 
@@ -1070,6 +1063,20 @@ async def post_chat(query_id: int, request: Request):
 
 
 def _post_chat(query_id: int, body: dict):
+    with _analysis_lock:
+        if query_id in _chat_ids:
+            raise HTTPException(409, "Une reponse de chat est deja en cours.")
+        _chat_ids.add(query_id)
+    try:
+        return _post_chat_turn(query_id, body)
+    finally:
+        with _analysis_lock:
+            _chat_ids.discard(query_id)
+
+
+def _post_chat_turn(query_id: int, body: dict):
+    if not isinstance(body, dict):
+        raise HTTPException(422, "Objet JSON requis")
     user_msg = body.get("message")
     if not isinstance(user_msg, str) or len(user_msg) > 10000:
         raise HTTPException(422, "message doit contenir au maximum 10000 caracteres")
@@ -1078,7 +1085,7 @@ def _post_chat(query_id: int, body: dict):
         raise HTTPException(400, "message requis")
 
     analysis_id = body.get("analysis_id")
-    from db.store import chat_get_messages, chat_add_message, get_query_detail, get_setting, get_conn
+    from db.store import chat_get_messages, chat_add_turn, get_query_detail, get_setting, get_conn
 
     # Charger le contexte de la requête
     detail = get_query_detail(query_id)
@@ -1096,19 +1103,13 @@ def _post_chat(query_id: int, body: dict):
     else:
         analysis = detail["analysis"]
 
-    context_block = f"""=== REQUÊTE SQL ===
-{q['sql_text']}
-
-=== MÉTRIQUES ===
-- Exécutions : {q.get('executions', '?')}
-- Temps moyen : {q.get('elapsed_ms_avg', '?')} ms
-- Temps max : {q.get('elapsed_ms_max', '?')} ms
-- Buffer gets moy : {q.get('buffer_gets_avg', '?')}
-- Disk reads moy : {q.get('disk_reads_avg', '?')}
-- Schéma : {q.get('schema_name', '?')}
-"""
-    if plan:
-        context_block += f"\n=== PLAN D'EXÉCUTION ===\n{(plan.get('plan_text') or '')}\n"
+    from analyzer.ai_analyzer import build_ai_preview
+    try:
+        context_block = build_ai_preview({
+            **q, "plan_text": (plan or {}).get("plan_text", ""),
+        })["prompt"]
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
     if analysis:
         context_block += f"\n=== ANALYSE IA PRÉCÉDENTE (score {analysis.get('perf_score')}/100) ===\n{(analysis.get('raw_response') or '')}\n"
 
@@ -1123,38 +1124,49 @@ def _post_chat(query_id: int, body: dict):
         messages.append({"role": msg["role"], "content": msg["content"]})
     messages.append({"role": "user", "content": user_msg})
 
-    # Sauvegarder la question
-    chat_add_message(query_id, "user", user_msg)
-
     # Appel IA
-    ai_model = get_setting("ai_model", "claude-sonnet-4.6")
+    ai_model = get_setting("ai_model", AI_MODEL)
     conn_ora = None
     try:
         from analyzer.oracle_tools import get_tools_schema_filtered, execute_tool_native
         from analyzer.copilot_client import chat_with_tools
+        from analyzer.data_policy import (
+            prepare_messages, sanitize_data, raw_values_enabled, check_budget, tool_payload,
+            ANALYSIS_TIMEOUT_SECONDS, MAX_TOOL_CALLS,
+        )
+        deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
+        send_raw = raw_values_enabled()
         try:
-            conn_ora = connect_oracle(
-                user=get_setting("oracle_user", ORACLE_USER),
-                password=get_setting("oracle_password", ORACLE_PASSWORD),
-                dsn=get_setting("oracle_dsn", ORACLE_DSN),
-            )
+            conn_ora = _oracle_connection(q)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
         except Exception:
-            pass
-        tools = get_tools_schema_filtered()
+            _log.warning("Oracle indisponible pour le chat %s", query_id, exc_info=True)
+        tools = get_tools_schema_filtered() if conn_ora is not None else []
         raw = ""
         usage = {}
+        tool_count = 0
         for round_index in range(11):
+            check_budget(deadline)
+            messages, safe_system = prepare_messages(messages, CHAT_SYSTEM, raw=send_raw)
             text, tool_calls, round_usage = chat_with_tools(
                 messages=messages, tools=tools if round_index < 10 else [],
-                model=ai_model, max_tokens=3000, system=CHAT_SYSTEM,
+                model=ai_model, max_tokens=3000, system=safe_system, deadline=deadline,
             )
+            check_budget(deadline)
             for key, value in (round_usage or {}).items():
                 if isinstance(value, (int, float)):
                     usage[key] = usage.get(key, 0) + value
             if text:
                 raw = text
-            if not tool_calls or round_index == 10:
+            if round_index == 10 and tool_calls:
+                raise ValueError("Limite des tours de chat depassee.")
+            if not tool_calls:
+                raw = text or ""
                 break
+            tool_count += len(tool_calls)
+            if tool_count > MAX_TOOL_CALLS:
+                raise ValueError("Limite des outils de chat depassee.")
             messages.append({
                 "role": "assistant", "content": text,
                 "tool_calls": [{"id": call["id"], "type": "function", "function": {
@@ -1162,9 +1174,21 @@ def _post_chat(query_id: int, body: dict):
                 }} for call in tool_calls],
             })
             for call in tool_calls:
-                result = execute_tool_native(conn_ora, call["name"], call["arguments"]) if conn_ora else {"error": "Oracle non disponible"}
+                check_budget(deadline)
+                arguments = dict(call["arguments"])
+                if call["name"] == "explain_plan":
+                    arguments.setdefault("child_number", q.get("child_number", 0))
+                elif call["name"] == "bind_captures" and arguments.get("sql_id") == q.get("sql_id"):
+                    arguments["child_number"] = q.get("child_number", 0)
+                result = execute_tool_native(conn_ora, call["name"], arguments,
+                                             deadline=deadline) if conn_ora else {"error": "Oracle non disponible"}
+                result = sanitize_data(result, raw=send_raw)
                 messages.append({"role": "tool", "tool_call_id": call["id"],
-                                 "content": json.dumps(result, default=str, ensure_ascii=True)})
+                                 "content": tool_payload(result)})
+        if not raw.strip():
+            raise ValueError("Reponse IA vide")
+    except HTTPException:
+        raise
     except Exception as e:
         import logging
         logging.getLogger("oracleiq").exception("Chat IA echoue pour %s", query_id)
@@ -1174,10 +1198,10 @@ def _post_chat(query_id: int, body: dict):
             try:
                 conn_ora.close()
             except Exception:
-                pass
+                _log.exception("Fermeture Oracle du chat echouee pour %s", query_id)
 
-    # Sauvegarder la réponse
-    chat_add_message(query_id, "assistant", raw)
+    # Persist only complete turns while the per-query reservation is held.
+    chat_add_turn(query_id, user_msg, raw)
 
     return {"reply": raw, "usage": usage}
 
@@ -1252,13 +1276,17 @@ async def delete_analysis(analysis_id: int, request: Request):
     else:
         # Mettre à jour le score de la requête avec l'analyse la plus récente restante
         latest = conn.execute(
-            "SELECT perf_score, severity FROM ai_analyses WHERE query_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT perf_score, severity, plan_id FROM ai_analyses WHERE query_id=? ORDER BY id DESC LIMIT 1",
             (query_id,)
         ).fetchone()
         if latest:
+            plan = conn.execute("SELECT id FROM execution_plans WHERE query_id=? ORDER BY id DESC LIMIT 1",
+                                (query_id,)).fetchone()
+            current = latest["plan_id"] == (plan["id"] if plan else None)
             conn.execute(
-                "UPDATE queries SET perf_score=?, severity=? WHERE id=?",
-                (latest["perf_score"], latest["severity"], query_id)
+                "UPDATE queries SET analyzed=?, perf_score=?, severity=? WHERE id=?",
+                (int(current), latest["perf_score"] if current else None,
+                 latest["severity"] if current else None, query_id)
             )
     conn.commit()
     conn.close()
@@ -1336,20 +1364,7 @@ async def settings_logout():
 async def settings_page(request: Request):
     if not _is_admin(request):
         return RedirectResponse("/settings/login", status_code=303)
-    settings = {
-        "analyzer_mode":    get_setting("analyzer_mode", "manual"),
-        "analyzer_ai_mode": "native",
-        "collector_active": get_setting("collector_active", "true") == "true",
-        "ai_model":         get_setting("ai_model", "claude-sonnet-4.6"),
-        "ai_max_tokens":    int(get_setting("ai_max_tokens", "8000")),
-        "plan_truncate":    int(get_setting("plan_truncate", "3000")),
-        "oracle_dsn":       get_setting("oracle_dsn",  ORACLE_DSN),
-        "oracle_user":      get_setting("oracle_user", ORACLE_USER),
-        "oracle_has_pwd":   bool(get_setting("oracle_password", ORACLE_PASSWORD)),
-        "tools_enabled":    get_setting("tools_enabled", ""),
-        "gather_stats_enabled": get_setting("gather_stats_enabled", "false") == "true",
-        "system_prompt":    get_setting("system_prompt", ""),
-    }
+    settings = get_all_settings(request)
     return templates.TemplateResponse(request=request, name="settings.html", context={
         "request": request,
         "settings": settings,

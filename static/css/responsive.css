@@ -319,6 +319,10 @@ body:not(.query-detail) .card-ai {
     color: #ff9ca0;
 }
 
+#aiPreviewMetadata {
+    white-space: pre-line;
+}
+
 .performance-table-wrap {
     overflow-x: auto;
     max-width: 100%;
@@ -472,6 +476,113 @@ body:not(.query-detail) .card-ai {
 .trace-entry {
     overflow-wrap: anywhere;
     min-width: 0;
+}
+
+.content-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+    min-width: 0;
+    margin-block: 12px;
+}
+
+.alerts-panel {
+    border-block: 1px solid var(--border);
+    margin-block: 20px;
+    padding-block: 18px;
+}
+
+.alerts-panel h2 {
+    font-size: 18px;
+}
+
+.alerts-list {
+    list-style: none;
+    padding: 0;
+    max-height: 32rem;
+    overflow-y: auto;
+    margin-block: 16px;
+}
+
+.alerts-list li {
+    padding: 14px 4px;
+    border-bottom: 1px solid var(--border);
+    overflow-wrap: anywhere;
+}
+
+.alerts-list h3 {
+    font-size: 15px;
+}
+
+.alerts-list p {
+    margin-block: 7px;
+}
+
+.alerts-list .badge,
+.alerts-list .nav-btn {
+    margin-left: 8px;
+}
+
+.alerts-panel .page-controls {
+    flex-wrap: wrap;
+}
+
+.content-table-wrap table,
+.ai-markdown .content-table-wrap table {
+    min-width: 0;
+    width: max-content;
+    max-width: none;
+}
+
+.content-table-wrap th,
+.content-table-wrap td {
+    max-width: 28rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.ai-markdown,
+.chat-msg,
+.query-detail .card,
+.query-detail .container {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chat-assistant pre .copy-code-btn,
+.ai-markdown pre .copy-code-btn {
+    opacity: 1;
+    min-width: 32px;
+    min-height: 32px;
+}
+
+.pill-select {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    padding: 4px;
+}
+
+.analysis-pill .pill-del {
+    display: inline-block;
+    opacity: 1;
+    min-width: 30px;
+    min-height: 30px;
+}
+
+.bind-item {
+    grid-template-columns: minmax(0, 1fr) minmax(0, .7fr) minmax(0, 2fr) auto;
+}
+
+.bind-item > * {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
 }
 
 .query-detail[data-admin="false"] .reanalyze-btns,
@@ -641,8 +752,12 @@ body:not(.query-detail) .card-ai {
     }
 
     .bind-item {
-        flex-wrap: wrap;
-        overflow-wrap: anywhere;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    .bind-value,
+    .bind-ts {
+        grid-column: 1 / -1;
     }
 
     .modal-box {

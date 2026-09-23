@@ -20,7 +20,7 @@ La limitation des appels est locale au processus ; garder un seul worker web.
 
 Utiliser un compte Oracle dedie a privileges minimaux, jamais SYSTEM/SYS.
 Le texte SQL, les valeurs de bind et les resultats des outils peuvent contenir des
-donnees sensibles et etre transmis au fournisseur IA choisi. Restreindre les outils
+donnees sensibles et etre transmis a GitHub Copilot. Restreindre les outils
 et les privileges Oracle selon les regles de votre organisation.
 
 Le rejeu et l'outil `run_select` exigent `ODIN_ALLOW_QUERY_EXECUTION=true`.
@@ -32,9 +32,50 @@ configurable via `ODIN_ORACLE_TIMEOUT_MS` ; la connexion TCP est limitee a 10 s.
 les parametres. EXPLAIN PLAN ecrit temporairement dans PLAN_TABLE.
 Les vues AWR exigent les droits et licences Oracle appropries.
 
+Le rejeu refuse explicitement les requetes avec binds, faute de valeurs de rejeu
+validees. Il refuse aussi les fiches dont le schema de parsing est inconnu ou
+different du schema courant de la connexion : il ne rejoue jamais la requete
+sur des objets homonymes par defaut. Ces refus ne sont pas des executions reussies.
+L'outil IA EXPLAIN cible l'enfant et le schema de parsing exacts, restaure le
+contexte de session et exige une `PLAN_TABLE` provisionnee dans le schema du
+compte de connexion. Il produit un plan estime, pas une mesure d'execution.
+La preparation Oracle de cette table doit etre effectuee par le DBA en recette,
+avec les privileges minimaux ; ODIN ne la cree pas automatiquement.
+
 Proteger `.env`, SQLite et les sauvegardes par les permissions du systeme et,
 si necessaire, le chiffrement du disque. Les secrets Oracle en SQLite ne sont pas
 chiffres par l'application. Aucun secret ne doit entrer dans Git ou les archives.
+
+## Confidentialite et limites IA
+
+Le reglage `ai_send_raw_values` vaut `false` par defaut. Avant chaque transmission
+a Copilot, les litteraux SQL, commentaires SQL, valeurs de binds et valeurs des
+lignes de donnees renvoyees par les outils sont masques. Les statistiques utiles
+au diagnostic sont conservees. L'administrateur peut activer explicitement les
+valeurs brutes dans les parametres ; ce choix s'applique aux prochaines
+transmissions, sans effacer les donnees deja envoyees.
+
+Ce masquage n'est pas une DLP exhaustive : les noms d'objets, metadonnees et textes
+libres peuvent rester sensibles. Il reduit aussi la precision du diagnostic de
+selectivite. Les captures SQLite locales et leurs sauvegardes conservent leurs
+valeurs originales. Garder des droits Oracle minimaux et verifier la politique
+de confidentialite de l'organisation avant d'activer l'analyse.
+
+L'apercu IA, reserve aux administrateurs, est construit depuis les donnees locales,
+sans connexion Oracle ni appel IA. Il montre le prompt utilisateur, le systeme
+effectif et les schemas d'outils proposes, pas les resultats
+futurs des outils. Un rafraichissement de plan au demarrage de l'analyse peut
+modifier ce contexte ; l'apercu n'est pas une approbation figee d'une transmission.
+
+Les budgets sont en caracteres, pas en tokens : 120 000 pour l'entree globale,
+40 000 pour le SQL, 16 000 pour le plan fourni et chaque resultat d'outil,
+20 000 pour le prompt systeme, 80 messages d'historique. Une reponse depassant
+48 000 caracteres est refusee apres reception. Une analyse est limitee a trente
+appels d'outils et trente-deux tours, avec une echeance globale de 180 secondes.
+Les depassements sont des erreurs explicites, pas des scores de remplacement.
+Ces limites ne constituent pas un plafond de facturation du fournisseur :
+`AI_MAX_TOKENS` reste une longueur souhaitee et la limite de reponse est verifiee
+apres reception.
 
 ## Migration et sauvegarde
 
@@ -44,6 +85,24 @@ Sauvegarder SQLite avec l'API `sqlite3.Connection.backup` ou la commande SQLite
 `.backup`, pas en copiant seulement le fichier principal pendant une ecriture WAL.
 Arreter les anciens processus avant de lancer la nouvelle version.
 
+Les commandes suivantes utilisent l'API de sauvegarde SQLite, verifient
+`integrity_check` et refusent d'ecraser un fichier existant :
+
+```sh
+python oracleiq.py backup sauvegarde-2026-09-23.db
+python oracleiq.py restore sauvegarde-2026-09-23.db restauration-2026-09-23.db
+```
+
+La sauvegarde peut lire une base active en WAL. La restauration cree une copie
+independante : elle ne remplace jamais la base en service et ne change pas
+`ODIN_DB_PATH`. Avant de basculer, arreter tous les processus ODIN, conserver
+l'ancienne base pour retour arriere, definir le nouveau `ODIN_DB_PATH`, puis
+redemarrer et controler les donnees. Une verification d'integrite SQLite n'est
+pas une validation metier. Les copies contiennent les memes donnees sensibles
+que l'original ; utiliser un repertoire a acces restreint, en particulier des
+ACL appropriees sous Windows. La planification et la conservation hors machine
+restent a configurer dans l'environnement de deploiement.
+
 L'identite est desormais `(source DSN, schema, SQL_ID, child_number)` ; le pattern
 normalise sert uniquement au regroupement. Les anciennes fiches sont rattachees
 lors de leur prochaine capture compatible. Les metriques deja fusionnees par
@@ -51,6 +110,12 @@ l'ancienne version ne peuvent pas etre reconstituees : conserver cet historique
 avec prudence et attendre les nouvelles captures. Les orphelins preexistants ne
 sont pas effaces automatiquement. Les nouvelles suppressions nettoient toutes
 les tables liees dans une transaction.
+
+Toute operation Oracle sur une fiche verifie le DSN d'origine contre celui de
+la connexion reelle. Une source absente ou differente est refusee, y compris
+apres un changement de cible dans l'administration. Deux alias Oracle ne sont
+pas supposes equivalents. La consultation de l'historique local reste possible.
+Les parametres Oracle sont enregistres et lus en un seul instantane transactionnel.
 
 Le « pic de moyenne » correspond au maximum des moyennes observees, pas au temps
 maximum d'une execution. Les moyennes viennent des compteurs cumulatifs V$SQL.
@@ -105,6 +170,13 @@ Le rafraichissement explicite utilise `POST /api/queries/{id}/binds/refresh`, re
 aux administrateurs. Une panne de rafraichissement ne supprime pas les captures
 locales. Les lecteurs ne disposent pas de ce bouton.
 
+Le collecteur rafraichit les plans/statistiques au plus toutes les cinq minutes
+et les binds toutes les minutes, avec capture anticipee lors d'un changement de
+plan ou de generation de curseur. Un diagnostic DBMS_XPLAN n'est pas un plan :
+il est rejete et une nouvelle tentative est possible apres trente secondes.
+Les captures de binds ciblent l'enfant Oracle exact. Ces intervalles ne rendent
+pas disponibles les binds qu'Oracle n'a pas lui-meme captures.
+
 ## Supervision des services
 
 L'administration affiche les derniers signaux du collecteur et de l'analyseur
@@ -133,8 +205,26 @@ redemarrage automatique n'est effectue par ce superviseur. Pour modifier les
 identifiants apres cet echec, lancer `python oracleiq.py web`, enregistrer et tester
 la configuration, arreter ce serveur web, puis relancer `python oracleiq.py all`.
 Les commandes `collect`, `analyze` et `web` restent utilisables separement.
+Les anciens points d'entree `run.py` et `run_web_only.py` deleguent au meme
+lanceur. Le chargement `.env` accepte UTF-8 avec BOM, guillemets et commentaires,
+sans expansion `${...}` ni remplacement des variables d'environnement existantes.
+Importer le module de lancement ne charge plus `.env`.
+
+Les journaux du collecteur sont emis via le logger du processus, sans dependance
+a un fichier `/tmp`. Configurer rotation et conservation dans le superviseur.
 
 ## Analyses
+
+Le prompt natif suit une methode adaptative : examiner d'abord le contexte, puis
+appeler uniquement les outils necessaires a une verification determinante.
+Aucun appel ni inventaire general n'est impose lorsque les donnees suffisent.
+Les reponses distinguent faits, hypotheses, limites et recommandations a valider ;
+le score reste indicatif. Le chat applique les memes principes sans imposer
+le format d'une analyse complete a chaque question.
+
+Un prompt personnalise enregistre dans l'administration reste prioritaire et
+n'est jamais remplace automatiquement. Pour revenir au nouveau prompt natif,
+ouvrir Administration > Prompt et choisir "Reinitialiser (vide)".
 
 Deux analyses web simultanees au maximum, 32 reservations partagees en SQLite.
 « Analyser tout » remplit ce lot et indique le nombre restant ; relancer ensuite.
@@ -145,6 +235,34 @@ Le service doit rester mono-worker web pour la reconnexion SSE en memoire.
 Une reponse IA vide ou invalide n'est jamais transformee en score. L'erreur est
 enregistree separement et une relance manuelle est possible. Un nouveau hash de
 plan rend la requete eligible a une nouvelle analyse automatique.
+
+Chaque resultat est rattache a l'identifiant de capture du plan utilise.
+Si une capture arrive pendant l'analyse, le resultat reste dans l'historique
+mais ne valide pas l'etat courant. Cette regle est conservatrice, meme si le hash
+structurel n'a pas change. Une purge des analyses efface aussi les erreurs
+precedentes pour permettre une reprise.
+Les erreurs sont egalement rattachees a la capture utilisee : l'echec tardif
+d'une ancienne analyse ne bloque pas l'analyse automatique de la nouvelle version.
+
+## Alertes locales
+
+Le dashboard affiche les alertes et leur historique. Seul un administrateur
+peut les acquitter. L'acquittement signifie "pris en compte", pas "corrige" :
+la resolution suit les mesures, et une rechute ouvre un nouvel incident.
+L'historique est conserve dans SQLite ; aucune notification externe n'est envoyee.
+
+Le serveur web evalue les signaux de service toutes les trente secondes.
+Un service jamais observe n'est pas declare en panne. Desactiver volontairement
+la collecte ou le mode automatique de l'analyseur n'est pas une panne. Le serveur
+web doit rester actif pour produire ces alertes : ce dispositif ne remplace pas
+une supervision externe de la machine ou de l'ensemble ODIN.
+
+Les regressions sont evaluees au plus une fois par minute, sur deux periodes
+consecutives de quinze minutes. Chaque periode doit avoir au moins dix executions
+et 50 % de couverture. Une alerte exige une hausse d'au moins 50 % ET 100 ms,
+avec une reference strictement positive. Ce sont des suspicions a investiguer,
+pas des preuves de regression. Une mesure absente ou insuffisante ne resout pas
+un incident existant. Les limites de selection V$SQL restent applicables.
 
 ## Catalogue des modeles Copilot
 
@@ -161,8 +279,23 @@ Un echec de rafraichissement ne les efface pas et ne modifie jamais `ai_model`.
 Un modele selectionne mais absent du catalogue reste selectionne et signale.
 
 Les routes `GET /api/models` (cache local uniquement) et `POST /api/models/refresh`
-(appel Copilot explicite) sont reservees aux administrateurs. Les autres
-fournisseurs IA conservent la selection locale, sans ce rafraichissement Copilot.
+(appel Copilot explicite) sont reservees aux administrateurs. Copilot est le
+seul fournisseur : les anciennes valeurs `openai`, `anthropic` et `ollama` sont
+refusees avant transmission, sans basculement silencieux.
+
+## Archive de distribution
+
+```sh
+python scripts/package_release.py odin-release.tar.gz
+```
+
+Le script utilise une liste de fichiers et de repertoires de code autorises,
+pas une copie globale du repertoire de travail. Les variantes `.env.*` (sauf
+`.env.example`), bases SQLite, sauvegardes, logs et liens symboliques sont exclus.
+Une archive existante n'est jamais ecrasee. `package.sh` appelle le meme script.
+Cela ne remplace pas la revue du code distribue : un secret insere dans un fichier
+source autorise reste un secret. Ne jamais renseigner `.env.example` avec des
+valeurs reelles.
 
 ## Installation et tests
 
@@ -180,7 +313,10 @@ Node est necessaire pour regenerer les ressources frontend et les tests navigate
 pas pour servir les fichiers deja presents dans `static/vendor`.
 Les tests Python utilisent SQLite temporaire ; les tests navigateur demarrent un
 serveur isole avec 65 requetes fictives. Aucun test ne contacte Oracle ou l'IA.
-Le pipeline GitHub Actions execute les deux suites sur Python 3.12 et Node 22.
+Le pipeline GitHub Actions execute les deux suites sur Linux et Windows avec
+Python 3.12 et Node 22. Playwright choisit le Python du venv selon la plateforme ;
+`ODIN_TEST_PYTHON` permet de le remplacer et `ODIN_TEST_PORT` de choisir un autre
+port que 8099. Le serveur navigateur isole active UTF-8.
 
 Pour regenerer le verrouillage Python apres une mise a jour volontaire :
 
@@ -188,6 +324,10 @@ Pour regenerer le verrouillage Python apres une mise a jour volontaire :
 pip install pip-tools
 pip-compile --no-emit-index-url --no-emit-trusted-host -o requirements.lock requirements.txt
 ```
+
+Verifier les marqueurs de plateforme apres regeneration : `uvloop` ne doit pas
+etre installe sur Windows, Cygwin ou PyPy. Le verrouillage partage conserve cette
+condition explicitement.
 
 Les tests Oracle reels (permissions, timeout du driver, plans multi-curseurs) et les
 appels aux fournisseurs IA doivent etre effectues dans un environnement de recette.

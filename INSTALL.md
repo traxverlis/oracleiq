@@ -85,7 +85,7 @@ ORACLE_DSN=monserveur:1521/MONSERVICE
 ORACLE_USER=odin_user
 ORACLE_PASSWORD=VotreMotDePasse123!
 
-AI_PROVIDER=github-copilot          # ou openai | anthropic | ollama
+AI_PROVIDER=github-copilot
 GITHUB_TOKEN=github_pat_REMPLACER_PAR_VOTRE_JETON
 AI_MODEL=claude-sonnet-4.6
 ```
@@ -99,6 +99,11 @@ Le SDK gère les limites du modèle : la longueur de réponse configurée dans O
 est une consigne, et non un plafond strict. Aucun compte connecté au CLI n'est
 utilisé implicitement.
 
+Copilot est le seul fournisseur pris en charge. Les anciennes configurations
+OpenAI, Anthropic et Ollama sont refusees avant transmission : aucun basculement
+silencieux vers Copilot. Les litteraux SQL et valeurs de binds sont masques par
+defaut ; l'envoi brut exige une activation explicite dans l'administration.
+
 ---
 
 ## Étape 4 — Tester la connexion Oracle
@@ -107,7 +112,7 @@ utilisé implicitement.
 python3 -c "
 import oracledb, os
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(encoding="utf-8-sig", interpolate=False)
 conn = oracledb.connect(
     user=os.getenv('ORACLE_USER'),
     password=os.getenv('ORACLE_PASSWORD'),

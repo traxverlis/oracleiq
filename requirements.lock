@@ -94,7 +94,9 @@ pygments==2.21.0
 python-dateutil==2.9.0.post0
     # via github-copilot-sdk
 python-dotenv==1.2.3
-    # via uvicorn
+    # via
+    #   -r requirements.txt
+    #   uvicorn
 python-multipart==0.0.32
     # via -r requirements.txt
 pyyaml==6.0.3
@@ -135,7 +137,7 @@ urllib3==2.7.0
     # via requests
 uvicorn[standard]==0.52.4
     # via -r requirements.txt
-uvloop==0.22.1
+uvloop==0.22.1 ; sys_platform != "win32" and sys_platform != "cygwin" and platform_python_implementation != "PyPy"
     # via uvicorn
 watchfiles==1.2.0
     # via uvicorn

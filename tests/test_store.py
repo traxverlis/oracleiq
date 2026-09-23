@@ -1,4 +1,6 @@
 import tempfile
+import io
+import sqlite3
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +10,7 @@ from db import store
 
 class StoreTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=Path.cwd(), prefix=".test-store-")
         self.addCleanup(self.temp.cleanup)
         self.path_patch = patch.object(store, "DB_PATH", Path(self.temp.name) / "store.db")
         self.path_patch.start()
@@ -85,6 +87,227 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.analyzing_queue_get(), [query_id])
         store.analyzing_queue_remove(query_id)
         self.assertEqual(store.analyzing_queue_get(), [])
+
+    def test_expired_reservations_resume_automatic_analysis_at_exact_deadline(self):
+        for entrypoint in ("get", "add", "unanalyzed"):
+            with self.subTest(entrypoint=entrypoint):
+                query_id = store.upsert_query(self.row(sql_id=entrypoint))
+                with patch.object(store.time, "time", return_value=10000):
+                    self.assertTrue(store.analyzing_queue_add(query_id))
+                with patch.object(store.time, "time", return_value=17199):
+                    self.assertNotIn(query_id, [row["id"] for row in store.get_unanalyzed()])
+                with patch.object(store.time, "time", return_value=17200):
+                    if entrypoint == "get":
+                        self.assertNotIn(query_id, store.analyzing_queue_get())
+                    elif entrypoint == "add":
+                        self.assertTrue(store.analyzing_queue_add(query_id))
+                        store.analyzing_queue_remove(query_id)
+                    self.assertIn(query_id, [row["id"] for row in store.get_unanalyzed()])
+
+    def test_invalid_reservation_timestamp_is_recoverable(self):
+        query_id = store.upsert_query(self.row())
+        connection = store.get_conn()
+        try:
+            with connection:
+                connection.execute("INSERT INTO analyzing_queue VALUES(?, 'invalid')", (query_id,))
+        finally:
+            connection.close()
+        self.assertEqual(store.get_unanalyzed()[0]["id"], query_id)
+        self.assertTrue(store.analyzing_queue_add(query_id))
+
+    def test_plan_snapshot_guards_against_analysis_finishing_after_plan_change(self):
+        query_id = store.upsert_query(self.row())
+        store.save_plan(query_id, "Plan hash value: 1")
+        snapshot = store.get_unanalyzed()[0]
+        self.assertEqual(snapshot["plan_id"], store.get_query_detail(query_id)["query"]["plan_id"])
+        store.save_plan(query_id, "Plan hash value: 2")
+        self.assertFalse(store.save_analysis(query_id, {"score": 99}, expected_plan_id=snapshot["plan_id"]))
+        detail = store.get_query_detail(query_id)
+        self.assertEqual(detail["query"]["analyzed"], 0)
+        self.assertIsNone(detail["query"]["perf_score"])
+        self.assertEqual(detail["analysis"]["plan_id"], snapshot["plan_id"])
+        self.assertEqual(detail["history"][0]["plan_id"], snapshot["plan_id"])
+        self.assertTrue(store.save_analysis(query_id, {"score": 50}, expected_plan_id=detail["query"]["plan_id"]))
+        self.assertEqual(store.get_query_detail(query_id)["query"]["analyzed"], 1)
+
+    def test_unversioned_and_no_plan_analysis_cannot_validate_a_new_plan(self):
+        query_id = store.upsert_query(self.row())
+        self.assertIsNone(store.get_unanalyzed()[0]["plan_id"])
+        store.save_plan(query_id, "Plan hash value: 1")
+        for arguments in ({}, {"expected_plan_id": None}):
+            with self.subTest(arguments=arguments):
+                store.save_analysis(query_id, {"score": 99}, **arguments)
+                detail = store.get_query_detail(query_id)
+                self.assertEqual(detail["query"]["analyzed"], 0)
+                self.assertIsNone(detail["analysis"]["plan_id"])
+
+    def test_first_plan_invalidates_planless_analysis(self):
+        query_id = store.upsert_query(self.row())
+        store.save_analysis(query_id, {"score": 99}, expected_plan_id=None)
+        store.save_plan(query_id, "Plan hash value: 1")
+        detail = store.get_query_detail(query_id)
+        self.assertEqual(detail["query"]["analyzed"], 0)
+        self.assertEqual(detail["query"]["plan_change_detected"], 0)
+
+    def test_changed_plan_without_oracle_hash_invalidates_analysis(self):
+        query_id = store.upsert_query(self.row())
+        store.save_plan(query_id, "TABLE ACCESS FULL")
+        plan_id = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_analysis(query_id, {"score": 99}, expected_plan_id=plan_id)
+        store.save_plan(query_id, "INDEX RANGE SCAN")
+        detail = store.get_query_detail(query_id)
+        self.assertEqual(detail["query"]["analyzed"], 0)
+        self.assertEqual(detail["query"]["plan_change_detected"], 1)
+
+    def test_stale_analysis_does_not_overwrite_current_result(self):
+        query_id = store.upsert_query(self.row())
+        store.save_plan(query_id, "Plan hash value: 1")
+        old_plan = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_plan(query_id, "Plan hash value: 2")
+        current_plan = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_analysis(query_id, {"score": 42}, expected_plan_id=current_plan)
+        store.save_analysis(query_id, {"score": 99}, expected_plan_id=old_plan)
+        self.assertEqual(store.get_query_detail(query_id)["query"]["perf_score"], 42)
+
+    def test_analysis_rejects_plan_from_another_query(self):
+        query_id = store.upsert_query(self.row())
+        other_id = store.upsert_query(self.row(sql_id="other"))
+        store.save_plan(other_id, "Plan hash value: 1")
+        plan_id = store.get_query_detail(other_id)["query"]["plan_id"]
+        with self.assertRaises(ValueError):
+            store.save_analysis(query_id, {"score": 99}, expected_plan_id=plan_id)
+        self.assertIsNone(store.get_query_detail(query_id)["analysis"])
+
+    def test_purging_analyses_clears_errors_and_requeues_query(self):
+        query_id = store.upsert_query(self.row())
+        store.save_analysis_error(query_id, "synthetic failure")
+        self.assertEqual(store.get_unanalyzed(), [])
+        store.purge_data("analyses")
+        self.assertEqual(store.get_unanalyzed()[0]["id"], query_id)
+        self.assertIsNone(store.get_query_detail(query_id)["query"]["analysis_error"])
+
+    def test_old_analysis_error_cannot_block_new_plan(self):
+        query_id = store.upsert_query(self.row())
+        store.save_plan(query_id, "Plan hash value: 1")
+        old_plan_id = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_plan(query_id, "Plan hash value: 2")
+        self.assertFalse(store.save_analysis_error(query_id, "old provider failure", expected_plan_id=old_plan_id))
+        detail = store.get_query_detail(query_id)
+        self.assertIsNone(detail["query"]["analysis_error"])
+        self.assertEqual(detail["query"]["analyzed"], 0)
+        self.assertEqual(store.get_unanalyzed()[0]["id"], query_id)
+        self.assertTrue(store.save_analysis_error(
+            query_id, "current provider failure", expected_plan_id=detail["query"]["plan_id"],
+        ))
+        self.assertEqual(store.get_query_detail(query_id)["query"]["analysis_error"], "current provider failure")
+        self.assertEqual(store.get_unanalyzed(), [])
+
+    def test_legacy_and_planless_errors_cannot_block_new_plan(self):
+        query_id = store.upsert_query(self.row())
+        self.assertTrue(store.save_analysis_error(query_id, "legacy failure"))
+        self.assertTrue(store.save_analysis_error(query_id, "explicit failure", expected_plan_id=None))
+        store.save_plan(query_id, "Plan hash value: 1")
+        self.assertFalse(store.save_analysis_error(query_id, "unversioned failure"))
+        self.assertFalse(store.save_analysis_error(query_id, "planless failure", expected_plan_id=None))
+        self.assertIsNone(store.get_query_detail(query_id)["query"]["analysis_error"])
+        self.assertFalse(store.save_analysis_error(-1, "missing query"))
+
+    def test_stale_error_preserves_already_validated_current_result(self):
+        query_id = store.upsert_query(self.row())
+        store.save_plan(query_id, "Plan hash value: 1")
+        old_plan_id = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_plan(query_id, "Plan hash value: 2")
+        current_plan_id = store.get_query_detail(query_id)["query"]["plan_id"]
+        store.save_analysis(query_id, {"score": 80}, expected_plan_id=current_plan_id)
+        self.assertFalse(store.save_analysis_error(query_id, "old failure", expected_plan_id=old_plan_id))
+        detail = store.get_query_detail(query_id)
+        self.assertEqual(detail["query"]["analyzed"], 1)
+        self.assertEqual(detail["query"]["perf_score"], 80)
+        self.assertIsNone(detail["query"]["analysis_error"])
+
+    def test_setting_batches_preserve_defaults_and_rollback_on_failure(self):
+        store.set_settings({"one": "1", "two": "2"})
+        defaults = {"one": "default", "two": "default", "missing": "fallback"}
+        self.assertEqual(store.get_settings(defaults), {"one": "1", "two": "2", "missing": "fallback"})
+        self.assertEqual(defaults["one"], "default")
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.set_settings({"one": "changed", "two": None})
+        self.assertEqual(store.get_setting("one"), "1")
+        self.assertEqual(store.get_settings({}), {})
+        with patch.object(store, "set_settings") as batch:
+            store.set_setting("one", "new")
+            batch.assert_called_once_with({"one": "new"})
+
+    def test_initialization_is_idempotent_and_ascii_console_safe(self):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="ascii")
+        with patch("sys.stdout", stream):
+            store.init_db()
+        stream.flush()
+        self.assertIn(b"[DB] Initialized", buffer.getvalue())
+
+    def test_additive_migration_preserves_existing_analyses_and_settings(self):
+        query_id = store.upsert_query(self.row())
+        store.save_analysis(query_id, {"score": 80})
+        store.set_setting("fixture_setting", "preserved")
+        connection = store.get_conn()
+        try:
+            with connection:
+                connection.execute("ALTER TABLE ai_analyses DROP COLUMN plan_id")
+                connection.execute("DROP TABLE alerts")
+        finally:
+            connection.close()
+        store.init_db()
+        detail = store.get_query_detail(query_id)
+        self.assertEqual(detail["analysis"]["perf_score"], 80)
+        self.assertIsNone(detail["analysis"]["plan_id"])
+        self.assertEqual(store.get_setting("fixture_setting"), "preserved")
+
+    def test_delete_and_purges_reject_active_analysis_reservations(self):
+        query_id = store.upsert_query(self.row())
+        store.save_analysis(query_id, {"score": 80})
+        store.analyzing_queue_add(query_id)
+        for operation in (
+            lambda: store.delete_query_data(query_id),
+            lambda: store.purge_data("all"),
+            lambda: store.purge_data("analyses"),
+            lambda: store.purge_data("analyzed"),
+        ):
+            with self.assertRaises(ValueError):
+                operation()
+            self.assertIsNotNone(store.get_query_detail(query_id)["analysis"])
+            self.assertEqual(store.analyzing_queue_get(), [query_id])
+        store.analyzing_queue_remove(query_id)
+        store.delete_query_data(query_id)
+        self.assertIsNone(store.get_query_detail(query_id)["query"])
+
+    def test_purge_unrelated_analyzed_queries_preserves_active_reservation(self):
+        query_id = store.upsert_query(self.row())
+        other_id = store.upsert_query(self.row(sql_id="other"))
+        store.save_analysis(other_id, {"score": 80})
+        store.analyzing_queue_add(query_id)
+        self.assertEqual(store.purge_data("analyzed")["queries"], 1)
+        self.assertEqual(store.analyzing_queue_get(), [query_id])
+
+    def test_expired_reservation_does_not_prevent_deletion(self):
+        query_id = store.upsert_query(self.row())
+        with patch.object(store.time, "time", return_value=10000):
+            store.analyzing_queue_add(query_id)
+        with patch.object(store.time, "time", return_value=17200):
+            store.delete_query_data(query_id)
+        self.assertIsNone(store.get_query_detail(query_id)["query"])
+        with self.assertRaises(ValueError):
+            store.analyzing_queue_add(query_id)
+
+    def test_chat_turn_is_atomic_and_preserves_message_order(self):
+        query_id = store.upsert_query(self.row())
+        with self.assertRaises(sqlite3.IntegrityError):
+            store.chat_add_turn(query_id, "question", None)
+        self.assertEqual(store.chat_get_messages(query_id), [])
+        store.chat_add_turn(query_id, "question", "response")
+        messages = store.chat_get_messages(query_id)
+        self.assertEqual([(row["role"], row["content"]) for row in messages],
+                         [("user", "question"), ("assistant", "response")])
 
     def test_global_search_pagination_and_grouping(self):
         first = store.upsert_query(self.row(sql_text="select " + "column, " * 40 + "needle from orders"))

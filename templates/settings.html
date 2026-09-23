@@ -256,7 +256,7 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>DSN (host:port/service)</label>
+            <label for="oracle_dsn">DSN (host:port/service)</label>
             <span class="setting-desc">Ex&nbsp;: <code>db-prod:1521/ORCL</code></span>
           </div>
           <div class="setting-control">
@@ -267,7 +267,7 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Utilisateur</label>
+            <label for="oracle_user">Utilisateur</label>
             <span class="setting-desc">Accès en lecture à V$SQL, DBA_HIST_*, DBMS_XPLAN</span>
           </div>
           <div class="setting-control">
@@ -278,7 +278,7 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Mot de passe</label>
+            <label for="oracle_password">Mot de passe</label>
             <span class="setting-desc">Stocké dans la DB SQLite locale (non chiffré)</span>
           </div>
           <div class="setting-control">
@@ -307,10 +307,10 @@
         <h2>🔍 Collecte Oracle</h2>
         <div class="setting-row" style="border:none">
           <div class="setting-info">
-            <label>État du collecteur</label>
+            <span id="collectorLabel">État du collecteur</span>
             <span class="setting-desc">Active ou suspend la récupération des requêtes depuis V$SQL</span>
           </div>
-          <div class="setting-control">
+          <div class="setting-control" role="group" aria-labelledby="collectorLabel">
             <button id="btnCollectorOn" class="mode-btn {% if settings.collector_active %}active{% endif %}"
               onclick="toggle('collector_active', true)">▶ Actif</button>
             <button id="btnCollectorOff" class="mode-btn {% if not settings.collector_active %}active{% endif %}"
@@ -328,7 +328,7 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Analyses IA uniquement</label>
+            <span>Analyses IA uniquement</span>
             <span class="setting-desc">Efface les analyses, scores et conversations. Les requêtes et plans sont
               conservés.</span>
           </div>
@@ -339,7 +339,7 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Requêtes déjà analysées</label>
+            <span>Requêtes déjà analysées</span>
             <span class="setting-desc">Efface les requêtes marquées comme analysées et toutes leurs données
               liées.</span>
           </div>
@@ -350,7 +350,7 @@
 
         <div class="setting-row" style="border:none">
           <div class="setting-info">
-            <label>Tout supprimer</label>
+            <span>Tout supprimer</span>
             <span class="setting-desc">Requêtes, plans d'exécution, bind variables, historiques et analyses.
               Irréversible.</span>
           </div>
@@ -373,11 +373,11 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Mode d'analyse</label>
+            <span id="analysisModeLabel">Mode d'analyse</span>
             <span class="setting-desc">Manuelle : clic par clic. Auto : toutes les nouvelles requêtes
               automatiquement</span>
           </div>
-          <div class="setting-control">
+          <div class="setting-control" role="group" aria-labelledby="analysisModeLabel">
             <button id="btnManual" class="mode-btn {% if settings.analyzer_mode == 'manual' %}active{% endif %}"
               onclick="toggle('analyzer_mode', 'manual')">Manuelle</button>
             <button id="btnAuto" class="mode-btn {% if settings.analyzer_mode == 'auto' %}active{% endif %}"
@@ -429,8 +429,8 @@
 
         <div class="setting-row">
           <div class="setting-info">
-            <label>Longueur de réponse (tokens)</label>
-            <span class="setting-desc">Longueur souhaitée, sans plafond strict avec le SDK Copilot.</span>
+            <label for="ai_max_tokens">Longueur de réponse (tokens)</label>
+            <span class="setting-desc">Objectif configurable jusqu’à 32000 tokens, sans plafond strict garanti par le SDK Copilot.</span>
           </div>
           <div class="setting-control">
             <select id="ai_max_tokens" class="setting-select" onchange="save('ai_max_tokens', parseInt(this.value))">
@@ -445,19 +445,31 @@
 
         <div class="setting-row" style="border:none">
           <div class="setting-info">
-            <label>Taille max du plan Oracle</label>
+            <label for="plan_truncate">Taille max du plan Oracle</label>
             <span class="setting-desc">Tronque le plan au-delà de cette limite pour ne pas surcharger le contexte
-              IA</span>
+              IA. Plafond : 16000 caractères.</span>
           </div>
           <div class="setting-control">
             <select id="plan_truncate" class="setting-select" onchange="save('plan_truncate', parseInt(this.value))">
               <option value="1500" {% if settings.plan_truncate==1500 %}selected{% endif %}>1500 chars — léger</option>
-              <option value="3000" {% if settings.plan_truncate==3000 %}selected{% endif %}>3000 chars ★</option>
-              <option value="5000" {% if settings.plan_truncate==5000 %}selected{% endif %}>5000 chars — complet
+              <option value="3000" {% if settings.plan_truncate==3000 %}selected{% endif %}>3000 chars</option>
+              <option value="5000" {% if settings.plan_truncate==5000 %}selected{% endif %}>5000 chars
               </option>
               <option value="10000" {% if settings.plan_truncate==10000 %}selected{% endif %}>10000 chars — étendu
               </option>
+              <option value="16000" {% if settings.plan_truncate==16000 %}selected{% endif %}>16000 chars — plafond ★</option>
             </select>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <label for="ai_send_raw_values">Envoyer les valeurs brutes à GitHub Copilot</label>
+            <span class="setting-desc" id="privacyWarning">Désactivé par défaut : les valeurs sont masquées par précaution, sans garantie d’absence de données sensibles ; des identifiants et du texte libre peuvent rester visibles. Attention : activer cette option transmet les valeurs SQL, binds et résultats d’outils à GitHub Copilot. Les erreurs Oracle restent expurgées même en mode brut. Aucun autre fournisseur n’est utilisé. Vérifiez l’aperçu du contexte sur la fiche requête avant l’analyse.</span>
+          </div>
+          <div class="setting-control">
+            <input id="ai_send_raw_values" type="checkbox" aria-describedby="privacyWarning"
+              {% if settings.ai_send_raw_values %}checked{% endif %}
+              onchange="save('ai_send_raw_values', this.checked)">
           </div>
         </div>
       </section>
@@ -516,7 +528,23 @@
             <input type="checkbox" id="tool-sql_plan_history" onchange="saveTools()" checked>
             <div class="tool-card-body">
               <div class="tool-card-name">sql_plan_history <span class="tool-card-badge badge-safe">lecture</span></div>
-              <div class="tool-card-desc">Historique des plans d'exécution depuis V$SQL / AWR.</div>
+              <div class="tool-card-desc">Curseurs enfants en mémoire (child_number, plan_hash_value) depuis V$SQL.</div>
+            </div>
+          </label>
+
+          <label class="tool-card" id="tc-cursor_plan">
+            <input type="checkbox" id="tool-cursor_plan" onchange="saveTools()" checked>
+            <div class="tool-card-body">
+              <div class="tool-card-name">cursor_plan <span class="tool-card-badge badge-safe">lecture</span></div>
+              <div class="tool-card-desc">Plan réellement utilisé par enfant ou plan_hash_value (curseur ou AWR).</div>
+            </div>
+          </label>
+
+          <label class="tool-card" id="tc-sql_monitor">
+            <input type="checkbox" id="tool-sql_monitor" onchange="saveTools()" checked>
+            <div class="tool-card-body">
+              <div class="tool-card-name">sql_monitor <span class="tool-card-badge badge-safe">lecture</span></div>
+              <div class="tool-card-desc">Lignes réelles et temps par opération (SQL Monitor + ASH, Tuning Pack requis).</div>
             </div>
           </label>
 
@@ -607,7 +635,8 @@
           <span id="promptModeLabel" style="font-size:12px;color:var(--text-dim)"></span>
         </div>
 
-        <textarea id="systemPromptEditor" class="prompt-editor"
+        <label for="systemPromptEditor">Instructions du système</label>
+        <textarea id="systemPromptEditor" class="prompt-editor" maxlength="20000" aria-describedby="promptHint"
           placeholder="Chargement du prompt par défaut…">{{ settings.system_prompt or '' }}</textarea>
 
         <div class="prompt-actions">
@@ -686,21 +715,53 @@
     }
 
     // ─── Save générique ────────────────────────────────────────
-    function save(key, val) {
-      fetch('/api/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [key]: val })
-      }).then(r => r.json()).then(() => flashSave());
-    }
+    let settingsWrites = Promise.resolve();
+    let pendingWrites = 0;
+    let saveMessageTimer;
+    const savedSettings = {
+      collector_active: {{ settings.collector_active | tojson }},
+      analyzer_mode: {{ settings.analyzer_mode | tojson }},
+      ai_model: {{ settings.ai_model | tojson }},
+      ai_max_tokens: {{ settings.ai_max_tokens | tojson }},
+      plan_truncate: {{ settings.plan_truncate | tojson }},
+      ai_send_raw_values: {{ (settings.ai_send_raw_values or false) | tojson }},
+    };
 
-    function flashSave() {
+    function settingsMessage(message, error = false) {
+      clearTimeout(saveMessageTimer);
       const msg = document.getElementById('saveMsg');
+      msg.textContent = message;
+      msg.setAttribute('role', error ? 'alert' : 'status');
+      msg.style.color = error ? '#f87171' : '';
       msg.style.display = 'block';
-      setTimeout(() => msg.style.display = 'none', 2000);
     }
 
-    function toggle(key, val) {
-      save(key, val);
+    function queueSettings(body) {
+      pendingWrites++;
+      document.querySelectorAll('[onchange*="save"], [onclick*="save"], [onclick*="toggle("], [onclick*="toolsSelect"], [onclick*="resetPrompt"]').forEach(el => el.disabled = true);
+      settingsMessage('Enregistrement en cours…');
+      const operation = settingsWrites.then(() => requestJSON('/api/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }));
+      settingsWrites = operation.catch(() => {});
+      return operation.finally(() => {
+        if (--pendingWrites === 0) {
+          document.querySelectorAll('[onchange*="save"], [onclick*="save"], [onclick*="toggle("], [onclick*="toolsSelect"], [onclick*="resetPrompt"]').forEach(el => el.disabled = false);
+        }
+      });
+    }
+
+    function applySetting(key, val) {
+      const input = document.getElementById(key);
+      if (input) {
+        if (input.type === 'checkbox') input.checked = Boolean(val);
+        else {
+          if (key === 'ai_model' && ![...input.options].some(option => option.value === val)) {
+            input.add(new Option(val, val));
+          }
+          input.value = val;
+        }
+      }
       if (key === 'collector_active') {
         document.getElementById('btnCollectorOn').classList.toggle('active', val === true);
         document.getElementById('btnCollectorOff').classList.toggle('active', val === false);
@@ -708,6 +769,28 @@
         document.getElementById('btnManual').classList.toggle('active', val === 'manual');
         document.getElementById('btnAuto').classList.toggle('active', val === 'auto');
       }
+    }
+
+    async function save(key, val) {
+      try {
+        await queueSettings({ [key]: val });
+        savedSettings[key] = val;
+        applySetting(key, val);
+        flashSave();
+      } catch (error) {
+        applySetting(key, savedSettings[key]);
+        settingsMessage(`Échec de l’enregistrement : ${error.message}`, true);
+      }
+    }
+
+    function flashSave() {
+      if (pendingWrites) return;
+      settingsMessage('✓ Enregistré');
+      saveMessageTimer = setTimeout(() => document.getElementById('saveMsg').style.display = 'none', 3000);
+    }
+
+    function toggle(key, val) {
+      return save(key, val);
     }
 
     // ─── Oracle ────────────────────────────────────────────────
@@ -724,15 +807,15 @@
       const pwd = document.getElementById('oracle_password').value;
       const body = { oracle_dsn: dsn, oracle_user: user };
       if (pwd) body.oracle_password = pwd;
-      fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-        .then(async response => {
-          const result = await response.json();
-          if (!response.ok || !result.ok) throw new Error('Sauvegarde refusée');
+      queueSettings(body)
+        .then(() => {
+          flashSave();
           document.getElementById('btnSaveOracle').style.display = 'none';
           const s = document.getElementById('oracleSaveStatus');
           s.textContent = '✅ Enregistré — redémarrez le collecteur pour appliquer';
           s.style.color = '#34d399';
         }).catch(() => {
+          settingsMessage('Échec de l’enregistrement de la connexion.', true);
           document.getElementById('btnSaveOracle').style.display = 'inline-flex';
           const s = document.getElementById('oracleSaveStatus');
           s.textContent = 'Échec de l’enregistrement. Vérifiez votre session et réessayez.';
@@ -802,7 +885,7 @@
     // ─── Outils IA ─────────────────────────────────────────────
     const ALL_TOOLS = [
       'describe_table', 'describe_object', 'describe_mview', 'table_dml_since_stats',
-      'sql_plan_history', 'explain_plan', 'awr_sql_stats', 'awr_top_sql', 'bind_captures',
+      'sql_plan_history', 'cursor_plan', 'sql_monitor', 'explain_plan', 'awr_sql_stats', 'awr_top_sql', 'bind_captures',
       'scheduler_jobs', 'active_locks', 'run_select', 'gather_table_stats'
     ];
 
@@ -836,32 +919,40 @@
       });
     }
 
-    function saveTools() {
+    async function saveTools() {
       // Reconstruire l'ensemble depuis les checkboxes (sauf gather_table_stats)
       const regular = ALL_TOOLS.filter(t => t !== 'gather_table_stats');
       const active = regular.filter(t => document.getElementById('tool-' + t)?.checked);
       const csv = active.length ? active.join(',') : 'none';
-      _toolsEnabled = new Set(active);
-      if (_gatherStats) _toolsEnabled.add('gather_table_stats');
-      // Mettre à jour les styles
-      ALL_TOOLS.forEach(name => {
-        const card = document.getElementById('tc-' + name);
-        if (card) card.classList.toggle('active', _toolsEnabled.has(name));
-      });
-      fetch('/api/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tools_enabled: csv })
-      }).then(r => r.json()).then(() => flashSave());
+      try {
+        await queueSettings({ tools_enabled: csv });
+        _toolsEnabled = new Set(active);
+        if (_gatherStats) _toolsEnabled.add('gather_table_stats');
+        flashSave();
+      } catch (error) {
+        settingsMessage(`Échec de l’enregistrement des outils : ${error.message}`, true);
+      } finally {
+        ALL_TOOLS.forEach(name => {
+          document.getElementById('tool-' + name).checked = _toolsEnabled.has(name);
+          document.getElementById('tc-' + name).classList.toggle('active', _toolsEnabled.has(name));
+        });
+      }
     }
 
-    function saveGatherStats(cb) {
-      _gatherStats = cb.checked;
-      const card = document.getElementById('tc-gather_table_stats');
-      if (card) card.classList.toggle('active', _gatherStats);
-      fetch('/api/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gather_stats_enabled: _gatherStats })
-      }).then(r => r.json()).then(() => flashSave());
+    async function saveGatherStats(cb) {
+      const desired = cb.checked;
+      try {
+        await queueSettings({ gather_stats_enabled: desired });
+        _gatherStats = desired;
+        if (desired) _toolsEnabled.add('gather_table_stats');
+        else _toolsEnabled.delete('gather_table_stats');
+        flashSave();
+      } catch (error) {
+        settingsMessage(`Échec de l’enregistrement des statistiques : ${error.message}`, true);
+      } finally {
+        cb.checked = _gatherStats;
+        document.getElementById('tc-gather_table_stats').classList.toggle('active', _gatherStats);
+      }
     }
 
     function toolsSelectAll() {
@@ -882,6 +973,7 @@
 
     // ─── Prompt ────────────────────────────────────────────────
     let _defaultPrompts = null;
+    let savedPrompt = {{ settings.system_prompt | tojson }};
 
     function loadDefaultPrompt() {
       const label = document.getElementById('promptModeLabel');
@@ -905,31 +997,38 @@
     function updatePromptHint() {
       const editor = document.getElementById('systemPromptEditor');
       const hint = document.getElementById('promptHint');
-      const saved = {{ settings.system_prompt | tojson }};
-      if (!editor.value.trim()) {
-        hint.textContent = 'Prompt par défaut ODIN sera utilisé';
-      } else if (editor.value === saved) {
-        hint.textContent = '✅ Prompt personnalisé actif — ' + editor.value.length + ' caractères';
+      const saved = savedPrompt;
+      const length = editor.value.length + ' / 20000 caractères';
+      if (editor.value.length > 20000) {
+        hint.textContent = '⚠️ Limite dépassée — ' + length + '. Réduisez le texte avant l’enregistrement.';
+      } else if (editor.value !== saved) {
+        hint.textContent = '⚠️ Non enregistré — ' + length;
+      } else if (!editor.value.trim()) {
+        hint.textContent = 'Prompt par défaut ODIN sera utilisé — limite personnalisée : 20000 caractères';
       } else {
-        hint.textContent = '⚠️ Non enregistré — ' + editor.value.length + ' caractères';
+        hint.textContent = '✅ Prompt personnalisé actif — ' + length;
       }
     }
 
     document.getElementById('systemPromptEditor').addEventListener('input', updatePromptHint);
 
-    function savePrompt() {
+    async function savePrompt() {
       const val = document.getElementById('systemPromptEditor').value;
-      fetch('/api/settings', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ system_prompt: val })
-      }).then(r => r.json()).then(() => {
-        const res = document.getElementById('promptSaveResult');
+      const res = document.getElementById('promptSaveResult');
+      res.style.display = 'none';
+      try {
+        await queueSettings({ system_prompt: val });
+        savedPrompt = val;
+        flashSave();
         res.style.display = 'block'; res.className = 'test-result success';
         res.textContent = val.trim() ? '✅ Prompt personnalisé enregistré' : '✅ Réinitialisé — prompt ODIN par défaut actif';
         document.getElementById('promptModeLabel').textContent = '';
         updatePromptHint();
-        setTimeout(() => res.style.display = 'none', 3000);
-      });
+      } catch (error) {
+        settingsMessage(`Échec de l’enregistrement du prompt : ${error.message}`, true);
+        res.style.display = 'block'; res.className = 'test-result error';
+        res.textContent = `Non enregistré : ${error.message}. Votre texte est conservé.`;
+      }
     }
 
     function resetPrompt() {

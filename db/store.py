@@ -10,6 +10,10 @@ from pathlib import Path
 from config import DB_PATH
 
 
+ANALYSIS_RESERVATION_SECONDS = 2 * 60 * 60
+_UNVERSIONED_PLAN = object()
+
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -115,6 +119,21 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_performance_query_time
         ON performance_samples(query_id, observed_at);
+    CREATE INDEX IF NOT EXISTS idx_performance_time ON performance_samples(observed_at);
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedup_key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('service', 'regression')),
+        severity TEXT NOT NULL CHECK (severity IN ('warning', 'critical')),
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        query_id INTEGER REFERENCES queries(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        acknowledged_at TEXT,
+        resolved_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_active
+        ON alerts(dedup_key) WHERE resolved_at IS NULL;
     """)
     # Migration : ajouter tokens_in / tokens_out si absents
     cols = [r[1] for r in conn.execute('PRAGMA table_info(ai_analyses)').fetchall()]
@@ -124,6 +143,8 @@ def init_db():
         conn.execute('ALTER TABLE ai_analyses ADD COLUMN tokens_out INTEGER DEFAULT 0')
     if 'trace' not in cols:
         conn.execute('ALTER TABLE ai_analyses ADD COLUMN trace TEXT')
+    if 'plan_id' not in cols:
+        conn.execute('ALTER TABLE ai_analyses ADD COLUMN plan_id INTEGER REFERENCES execution_plans(id) ON DELETE SET NULL')
     # Migration : ajouter plan_change_detected si absent
     qcols = [r[1] for r in conn.execute('PRAGMA table_info(queries)').fetchall()]
     if 'plan_change_detected' not in qcols:
@@ -153,7 +174,7 @@ def init_db():
     _ensure_settings(conn)
     conn.commit()
     conn.close()
-    print(f"[DB] Initialisée → {DB_PATH}")
+    print("[DB] Initialized")
 
 
 def upsert_query(row: dict) -> int:
@@ -294,33 +315,44 @@ def upsert_query(row: dict) -> int:
 
 
 def save_plan(query_id: int, plan_text: str, plan_json: dict = None, plan_hash_value: int = None):
-    conn = get_conn()
     import re
     if plan_hash_value is None:
         match = re.search(r"Plan hash value:\s*(\d+)", plan_text or "", re.IGNORECASE)
         plan_hash_value = int(match.group(1)) if match else None
-    last_plan = conn.execute(
-        "SELECT plan_hash_value FROM execution_plans WHERE query_id=? AND plan_hash_value IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (query_id,)
-    ).fetchone()
-    plan_change = bool(last_plan and plan_hash_value is not None and last_plan[0] != plan_hash_value)
-    conn.execute(
-        "INSERT INTO execution_plans (query_id, plan_text, plan_json, plan_hash_value) VALUES (?,?,?,?)",
-        (query_id, plan_text, json.dumps(plan_json) if plan_json else None, plan_hash_value)
-    )
-    if plan_hash_value is not None:
-        conn.execute("UPDATE queries SET plan_hash_value=? WHERE id=?", (plan_hash_value, query_id))
-    if plan_change:
-        conn.execute(
-            "UPDATE queries SET plan_change_detected=1, analyzed=0, analysis_error=NULL WHERE id=?",
-            (query_id,)
-        )
-    conn.commit()
-    conn.close()
+    conn = get_conn()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            last_plan = conn.execute(
+                "SELECT plan_hash_value,plan_text FROM execution_plans WHERE query_id=? ORDER BY id DESC LIMIT 1",
+                (query_id,),
+            ).fetchone()
+            plan_change = bool(last_plan and (
+                last_plan["plan_hash_value"] != plan_hash_value
+                if last_plan["plan_hash_value"] is not None and plan_hash_value is not None
+                else last_plan["plan_text"] != plan_text
+            ))
+            conn.execute(
+                "INSERT INTO execution_plans (query_id, plan_text, plan_json, plan_hash_value) VALUES (?,?,?,?)",
+                (query_id, plan_text, json.dumps(plan_json) if plan_json else None, plan_hash_value),
+            )
+            conn.execute("UPDATE queries SET plan_hash_value=? WHERE id=?", (plan_hash_value, query_id))
+            if last_plan is None or plan_change:
+                conn.execute(
+                    "UPDATE queries SET plan_change_detected=MAX(plan_change_detected, ?), "
+                    "analyzed=0, analysis_error=NULL WHERE id=?", (int(plan_change), query_id),
+                )
+    finally:
+        conn.close()
 
 
-def save_analysis(query_id: int, analysis: dict):
-    """Enregistre une analyse IA et met à jour le score/severité de la requête."""
+def save_analysis(query_id: int, analysis: dict, *, expected_plan_id=_UNVERSIONED_PLAN):
+    """Archive the result; only a matching plan snapshot validates current state.
+
+    Return True when current state was validated, False for an archived stale result.
+    Legacy callers without a snapshot can validate plan-less queries only.
+    Explicit None means the caller observed no plan, not "use the latest plan".
+    """
     usage = analysis.get("usage") or {}
     tokens_in = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
     tokens_out = usage.get("completion_tokens") or usage.get("output_tokens") or 0
@@ -328,30 +360,46 @@ def save_analysis(query_id: int, analysis: dict):
     severity = analysis.get("severity") or "warning"
 
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO ai_analyses
-            (query_id, model_used, perf_score, severity, summary,
-             issues, recommendations, raw_response, tokens_in, tokens_out, trace)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        query_id,
-        analysis.get("model", ""),
-        score,
-        severity,
-        analysis.get("summary", ""),
-        json.dumps(analysis.get("issues", []), ensure_ascii=False),
-        json.dumps(analysis.get("recommendations", []), ensure_ascii=False),
-        analysis.get("raw", ""),
-        tokens_in,
-        tokens_out,
-        json.dumps(analysis.get("trace", []), ensure_ascii=False),
-    ))
-    conn.execute(
-        "UPDATE queries SET analyzed = 1, perf_score = ?, severity = ?, analysis_error=NULL WHERE id = ?",
-        (score, severity, query_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                "SELECT id FROM execution_plans WHERE query_id=? ORDER BY id DESC LIMIT 1", (query_id,)
+            ).fetchone()
+            current_plan_id = latest[0] if latest else None
+            plan_id = None if expected_plan_id is _UNVERSIONED_PLAN else expected_plan_id
+            if plan_id is not None and conn.execute(
+                "SELECT 1 FROM execution_plans WHERE id=? AND query_id=?", (plan_id, query_id)
+            ).fetchone() is None:
+                raise ValueError("Analysis plan does not belong to this query")
+            conn.execute("""
+                INSERT INTO ai_analyses
+                    (query_id, model_used, perf_score, severity, summary,
+                     issues, recommendations, raw_response, tokens_in, tokens_out, trace, plan_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                query_id,
+                analysis.get("model", ""),
+                score,
+                severity,
+                analysis.get("summary", ""),
+                json.dumps(analysis.get("issues", []), ensure_ascii=False),
+                json.dumps(analysis.get("recommendations", []), ensure_ascii=False),
+                analysis.get("raw", ""),
+                tokens_in,
+                tokens_out,
+                json.dumps(analysis.get("trace", []), ensure_ascii=False),
+                plan_id,
+            ))
+            if plan_id == current_plan_id:
+                conn.execute(
+                    "UPDATE queries SET analyzed=1, perf_score=?, severity=?, analysis_error=NULL WHERE id=?",
+                    (score, severity, query_id),
+                )
+                return True
+            return False
+    finally:
+        conn.close()
 
 
 def save_bind_values(query_id: int, binds: list):
@@ -410,36 +458,6 @@ def get_bind_values(query_id: int) -> list:
     return [dict(r) for r in rows]
 
 
-    usage = analysis.get("usage") or {}
-    tokens_in  = usage.get("prompt_tokens", 0)
-    tokens_out = usage.get("completion_tokens", 0)
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO ai_analyses
-            (query_id, model_used, perf_score, severity,
-             summary, issues, recommendations, raw_response, tokens_in, tokens_out, trace)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        query_id,
-        analysis.get("model"),
-        analysis.get("score"),
-        analysis.get("severity"),
-        analysis.get("summary"),
-        json.dumps(analysis.get("issues", []), ensure_ascii=False),
-        json.dumps(analysis.get("recommendations", []), ensure_ascii=False),
-        analysis.get("raw"),
-        tokens_in,
-        tokens_out,
-        json.dumps(analysis.get("trace", []), ensure_ascii=False) if analysis.get("trace") else None,
-    ))
-    conn.execute(
-        "UPDATE queries SET perf_score=?, severity=?, analyzed=1 WHERE id=?",
-        (analysis.get("score"), analysis.get("severity"), query_id)
-    )
-    conn.commit()
-    conn.close()
-
-
 # ─── Settings ───────────────────────────────────────────────
 def _ensure_settings(conn):
     conn.execute("""
@@ -476,6 +494,18 @@ def chat_get_messages(query_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def chat_add_turn(query_id: int, user_content: str, assistant_content: str) -> None:
+    conn = get_conn()
+    try:
+        with conn:
+            conn.executemany(
+                "INSERT INTO query_chats(query_id,role,content) VALUES(?,?,?)",
+                ((query_id, "user", user_content), (query_id, "assistant", assistant_content)),
+            )
+    finally:
+        conn.close()
+
+
 def chat_clear(query_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM query_chats WHERE query_id=?", (query_id,))
@@ -483,28 +513,52 @@ def chat_clear(query_id: int):
     conn.close()
 
 
+def _expire_analysis_reservations(conn):
+    conn.execute(
+        "DELETE FROM analyzing_queue WHERE datetime(started_at) IS NULL "
+        "OR datetime(started_at) <= datetime(?, 'unixepoch')",
+        (time.time() - ANALYSIS_RESERVATION_SECONDS,),
+    )
+
+
 def analyzing_queue_add(query_id: int):
     conn = get_conn()
     try:
         with conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM analyzing_queue WHERE datetime(started_at) < datetime('now', '-2 hours')")
+            _expire_analysis_reservations(conn)
+            if conn.execute("SELECT 1 FROM queries WHERE id=?", (query_id,)).fetchone() is None:
+                raise ValueError("Requete introuvable")
             if conn.execute("SELECT 1 FROM analyzing_queue WHERE query_id=?", (query_id,)).fetchone():
                 return False
             if conn.execute("SELECT COUNT(*) FROM analyzing_queue").fetchone()[0] >= 32:
                 raise ValueError("File d'analyse pleine (32 taches maximum)")
-            conn.execute("INSERT INTO analyzing_queue(query_id, started_at) VALUES (?, CURRENT_TIMESTAMP)", (query_id,))
+            conn.execute("INSERT INTO analyzing_queue(query_id, started_at) VALUES (?, datetime(?, 'unixepoch'))",
+                         (query_id, time.time()))
             conn.execute("UPDATE queries SET analysis_error=NULL WHERE id=?", (query_id,))
         return True
     finally:
         conn.close()
 
 
-def save_analysis_error(query_id: int, message: str):
+def save_analysis_error(query_id: int, message: str, *, expected_plan_id=_UNVERSIONED_PLAN) -> bool:
+    """Record failure only for its captured plan; stale failures cannot block retries.
+
+    As for save_analysis, legacy calls may update plan-less queries only.
+    """
     conn = get_conn()
     try:
         with conn:
-            conn.execute("UPDATE queries SET analysis_error=? WHERE id=?", (message[:500], query_id))
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                "SELECT id FROM execution_plans WHERE query_id=? ORDER BY id DESC LIMIT 1", (query_id,)
+            ).fetchone()
+            current_plan_id = latest[0] if latest else None
+            plan_id = None if expected_plan_id is _UNVERSIONED_PLAN else expected_plan_id
+            if plan_id != current_plan_id:
+                return False
+            result = conn.execute("UPDATE queries SET analysis_error=? WHERE id=?", (message[:500], query_id))
+            return result.rowcount > 0
     finally:
         conn.close()
 
@@ -518,15 +572,28 @@ def analyzing_queue_remove(query_id: int):
 
 def analyzing_queue_get() -> list[int]:
     conn = get_conn()
-    rows = conn.execute("SELECT query_id FROM analyzing_queue WHERE datetime(started_at) >= datetime('now', '-2 hours')").fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    try:
+        with conn:
+            _expire_analysis_reservations(conn)
+            rows = conn.execute("SELECT query_id FROM analyzing_queue ORDER BY started_at, query_id").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
 
 def get_setting(key: str, default: str = "") -> str:
+    return get_settings({key: default})[key]
+
+
+def get_settings(defaults: dict[str, str]) -> dict[str, str]:
+    if not defaults:
+        return {}
     conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row[0] if row else default
+    try:
+        placeholders = ",".join("?" for _ in defaults)
+        rows = conn.execute(f"SELECT key, value FROM settings WHERE key IN ({placeholders})", tuple(defaults))
+        return {**defaults, **dict(rows)}
+    finally:
+        conn.close()
 
 def report_service(name, state, *, success=False, ttl=120):
     if name not in {"collector", "analyzer"}:
@@ -559,16 +626,26 @@ def get_service_health():
 
 
 def set_setting(key: str, value: str):
+    set_settings({key: value})
+
+
+def set_settings(values: dict[str, str]) -> None:
     conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", values.items())
+    finally:
+        conn.close()
 
 
 def delete_query_data(query_id: int):
     conn = get_conn()
     try:
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _expire_analysis_reservations(conn)
+            if conn.execute("SELECT 1 FROM analyzing_queue WHERE query_id=?", (query_id,)).fetchone():
+                raise ValueError("Une analyse est en cours pour cette requete")
             for table in ("ai_analyses", "execution_plans", "query_snapshots", "query_chats", "bind_values", "analyzing_queue"):
                 conn.execute(f"DELETE FROM {table} WHERE query_id=?", (query_id,))
             conn.execute("DELETE FROM queries WHERE id=?", (query_id,))
@@ -607,43 +684,49 @@ def purge_data(scope: str = "analyzed") -> dict:
     child_tables = ("ai_analyses", "execution_plans", "query_snapshots",
                     "query_chats", "bind_values", "analyzing_queue")
     conn = get_conn()
-    c = conn.cursor()
     counts = {"scope": scope}
-
-    if scope == "analyses":
-        counts["queries"] = 0
-        counts["analyses"] = c.execute("SELECT COUNT(*) FROM ai_analyses").fetchone()[0]
-        c.execute("DELETE FROM ai_analyses")
-        c.execute("DELETE FROM query_chats")
-        c.execute("DELETE FROM analyzing_queue")
-        c.execute("UPDATE queries SET analyzed = 0, perf_score = NULL, severity = NULL")
-    elif scope == "all":
-        counts["queries"] = c.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
-        counts["analyses"] = c.execute("SELECT COUNT(*) FROM ai_analyses").fetchone()[0]
-        for table in child_tables:
-            c.execute(f"DELETE FROM {table}")
-        c.execute("DELETE FROM queries")
-    else:
-        sub = "(SELECT id FROM queries WHERE analyzed = 1)"
-        counts["queries"] = c.execute("SELECT COUNT(*) FROM queries WHERE analyzed = 1").fetchone()[0]
-        counts["analyses"] = c.execute(
-            f"SELECT COUNT(*) FROM ai_analyses WHERE query_id IN {sub}"
-        ).fetchone()[0]
-        for table in child_tables:
-            c.execute(f"DELETE FROM {table} WHERE query_id IN {sub}")
-        c.execute("DELETE FROM queries WHERE analyzed = 1")
-
-    conn.commit()
-    conn.close()
-    # Signale au collecteur de vider son cache de hashes en memoire
-    set_setting("purge_epoch", str(int(time.time())))
-    return counts
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _expire_analysis_reservations(conn)
+            reservation_filter = "WHERE query_id IN (SELECT id FROM queries WHERE analyzed=1)" if scope == "analyzed" else ""
+            if conn.execute(f"SELECT 1 FROM analyzing_queue {reservation_filter} LIMIT 1").fetchone():
+                raise ValueError("Une analyse est en cours sur les donnees a purger")
+            if scope == "analyses":
+                counts["queries"] = 0
+                counts["analyses"] = conn.execute("SELECT COUNT(*) FROM ai_analyses").fetchone()[0]
+                conn.execute("DELETE FROM ai_analyses")
+                conn.execute("DELETE FROM query_chats")
+                conn.execute("DELETE FROM analyzing_queue")
+                conn.execute("UPDATE queries SET analyzed=0, perf_score=NULL, severity=NULL, analysis_error=NULL")
+            elif scope == "all":
+                counts["queries"] = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+                counts["analyses"] = conn.execute("SELECT COUNT(*) FROM ai_analyses").fetchone()[0]
+                for table in child_tables:
+                    conn.execute(f"DELETE FROM {table}")
+                conn.execute("DELETE FROM queries")
+            else:
+                sub = "(SELECT id FROM queries WHERE analyzed=1)"
+                counts["queries"] = conn.execute("SELECT COUNT(*) FROM queries WHERE analyzed=1").fetchone()[0]
+                counts["analyses"] = conn.execute(
+                    f"SELECT COUNT(*) FROM ai_analyses WHERE query_id IN {sub}"
+                ).fetchone()[0]
+                for table in child_tables:
+                    conn.execute(f"DELETE FROM {table} WHERE query_id IN {sub}")
+                conn.execute("DELETE FROM queries WHERE analyzed=1")
+            conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('purge_epoch',?)", (str(int(time.time())),))
+        return counts
+    finally:
+        conn.close()
 
 
 def get_unanalyzed(limit=20):
     conn = get_conn()
-    rows = conn.execute("""
-                SELECT q.*, ep.plan_text
+    try:
+        with conn:
+            _expire_analysis_reservations(conn)
+            rows = conn.execute("""
+                SELECT q.*, ep.plan_text, ep.id AS plan_id
         FROM queries q
                 LEFT JOIN execution_plans ep ON ep.id = (
                         SELECT id FROM execution_plans WHERE query_id=q.id ORDER BY id DESC LIMIT 1
@@ -655,8 +738,9 @@ def get_unanalyzed(limit=20):
         ORDER BY q.elapsed_ms_avg DESC
         LIMIT ?
     """, (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_all_queries(limit=100, order="elapsed_ms_avg DESC"):
@@ -750,6 +834,7 @@ def get_query_page(search="", schema="", critical_only=False, group=False, sort=
 
 def get_query_detail(query_id: int):
     conn = get_conn()
+    conn.execute("BEGIN")
     q = conn.execute("SELECT * FROM queries WHERE id=?", (query_id,)).fetchone()
     # Chercher le plan par query_id d'abord, puis par sql_id (en cas de re-capture)
     plan = conn.execute(
@@ -763,12 +848,12 @@ def get_query_detail(query_id: int):
     ).fetchone()
     # Historique complet (pour comparaison)
     history = conn.execute(
-        "SELECT id, analyzed_at, model_used, perf_score, severity, summary, tokens_in, tokens_out FROM ai_analyses WHERE query_id=? ORDER BY id DESC",
+        "SELECT id, analyzed_at, model_used, perf_score, severity, summary, tokens_in, tokens_out, plan_id FROM ai_analyses WHERE query_id=? ORDER BY id DESC",
         (query_id,)
     ).fetchall()
     conn.close()
     return {
-        "query": dict(q) if q else None,
+        "query": {**dict(q), "plan_id": plan["id"] if plan else None} if q else None,
         "plan": dict(plan) if plan else None,
         "analysis": dict(analysis) if analysis else None,
         "history": [dict(h) for h in history],
