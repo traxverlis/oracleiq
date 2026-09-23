@@ -6,14 +6,24 @@ import threading
 import unittest
 from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 from copilot import CopilotClient
 from analyzer import copilot_client
+from db import store
 
 
 @unittest.skipUnless(os.getenv("ODIN_TEST_COPILOT_RUNTIME") == "1", "Runtime integration opt-in")
 class CopilotRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        database = tempfile.TemporaryDirectory()
+        self.addCleanup(database.cleanup)
+        path_patch = patch.object(store, "DB_PATH", Path(database.name) / "runtime.db")
+        path_patch.start()
+        self.addCleanup(path_patch.stop)
+        store.init_db()
+
     def test_real_runtime_text_and_terminal_tool(self):
         requests = []
 

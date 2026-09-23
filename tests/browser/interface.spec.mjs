@@ -166,7 +166,7 @@ test('deselecting all Oracle tools persists after reload', async ({ page }) => {
     })).ok()).toBeTruthy();
     await page.goto('/settings');
     await page.locator('.tabs-bar button').nth(2).click();
-    await expect(page.locator('#toolsGrid input:checked')).toHaveCount(12);
+    await expect(page.locator('#toolsGrid input:checked')).toHaveCount(14);
     await saveSelection(() => page.getByRole('button', { name: 'Tout désélectionner' }).click(), 'none');
     await page.reload();
     await page.locator('.tabs-bar button').nth(2).click();
