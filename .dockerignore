@@ -1,0 +1,13 @@
+# Liste blanche : ni .env, ni base SQLite, ni venv dans l'image.
+*
+!requirements.lock
+!config.py
+!oracleiq.py
+!analyzer/**/*.py
+!api/**/*.py
+!collector/**/*.py
+!db/**/*.py
+!scripts/sqlite_backup.py
+!templates/**
+!static/**
+**/__pycache__

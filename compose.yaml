@@ -1,0 +1,17 @@
+services:
+  odin:
+    image: odin:1.0
+    build: .
+    env_file: .env
+    environment:
+      # Prioritaire sur .env : l'ecoute locale 127.0.0.1 rendrait le conteneur injoignable.
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - odin-data:/data
+    restart: unless-stopped
+
+volumes:
+  odin-data:

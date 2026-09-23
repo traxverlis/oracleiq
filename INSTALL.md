@@ -143,6 +143,45 @@ python oracleiq.py analyze          # boucle continue
 
 ---
 
+## Variante — Image Docker (Linux amd64)
+
+L'image contient le code, les dépendances verrouillées et le runtime Copilot ;
+ni `.env`, ni base SQLite. Tout l'état (base SQLite, jeton Copilot enregistré
+via l'administration) est dans `/data`, monté sur le volume nommé `odin-data` :
+il survit aux redémarrages, recréations du conteneur et mises à jour de l'image.
+
+Sur la machine de construction :
+
+```bash
+docker build -t odin:1.0 .
+docker save odin:1.0 | gzip > odin-1.0.tar.gz
+```
+
+Copier `odin-1.0.tar.gz`, `compose.yaml` et le `.env` (canal sûr, droits `600`)
+sur la machine cible, dans un même dossier, puis :
+
+```bash
+gunzip -c odin-1.0.tar.gz | docker load
+docker compose up -d        # http://<machine>:8080
+docker compose logs -f
+```
+
+- `ORACLE_DSN` doit être joignable depuis le conteneur : `localhost` désigne le conteneur lui-même.
+- `.env` est lu par Docker, sans guillemets ni commentaires en fin de ligne.
+- Exposé au réseau : définir `ODIN_SESSION_SECRET` et, derrière HTTPS, `ODIN_COOKIE_SECURE=true`.
+- Mise à jour : `docker load` de la nouvelle archive puis `docker compose up -d` ; le volume est conservé.
+  Ne pas utiliser `docker compose down -v`, qui supprime le volume et donc la base.
+
+Sauvegarde de la base vers l'hôte :
+
+```bash
+docker compose exec odin python /app/oracleiq.py backup /data/odin-backup.db
+docker compose cp odin:/data/odin-backup.db ./odin-backup.db
+docker compose exec odin rm /data/odin-backup.db
+```
+
+---
+
 ## Résolution de problèmes courants
 
 | Erreur | Cause probable | Solution |
